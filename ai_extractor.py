@@ -22,18 +22,11 @@ GEMINI_MODELS = [
 ]
 
 
-def _extract_nearfinder_hints(page_html: str, page_text: str) -> dict:
+def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dict:
     """
-    Structurally extract logo, description, and website URL from nearfinderus HTML.
-    Uses the actual DOM patterns found on nearfinderus.com listing pages —
-    no keyword guessing, no truncation risk.
-
-    Patterns confirmed from live HTML:
-    - Logo: <figure class="lazy-element lazy-element--rendered"><img ...>
-    - Description: <div class="mt-4"> ... <p>text</p> (first visible p, not inside display:none)
-    - Website URL: <a href="/en/empresa/redirect?url=ENCODED_URL&...">
-    - Social/WhatsApp: <a href="/en/empresa/redirect?url=https://api.whatsapp.com/...">
-    - GBP Link: <a href="https://www.google.com.br/maps/place/...">
+    Structurally extract logo, description, website URL, social links and GBP link
+    from page HTML using multiple fallback patterns — works for nearfinderus, askmap,
+    and any other source via generic fallbacks.
     """
     hints = {
         "logo_html": "",
@@ -50,68 +43,210 @@ def _extract_nearfinder_hints(page_html: str, page_text: str) -> dict:
         from urllib.parse import unquote
         soup = BeautifulSoup(page_html, "html.parser")
 
-        # ── Logo ──────────────────────────────────────────────────────────
-        # nearfinderus renders the business logo inside a lazy-element--rendered figure
-        for fig in soup.find_all("figure", class_=lambda c: c and "lazy-element--rendered" in " ".join(c)):
-            img = fig.find("img")
-            if img and img.get("src", ""):
-                hints["logo_html"] = str(img)
-                break
-        # Fallback: any img with /logos/ or /thumb_ in src (nearfinderus logo URL pattern)
-        if not hints["logo_html"]:
-            for img in soup.find_all("img"):
-                src = img.get("src", "")
-                if "/logos/" in src or "/thumb_" in src:
-                    hints["logo_html"] = str(img)
-                    break
+        # ── Helpers ───────────────────────────────────────────────────────
 
-        # ── Description ───────────────────────────────────────────────────
-        # nearfinderus puts description in <div class="mt-4"> → <p> (visible only)
-        desc_container = soup.find("div", class_="mt-4")
-        if desc_container:
-            for p in desc_container.find_all("p"):
-                # Skip paragraphs inside display:none parents (the hidden "See More" block)
-                hidden = False
-                for parent in p.parents:
-                    style = parent.get("style", "") if hasattr(parent, "get") else ""
-                    if "display: none" in style or "display:none" in style:
-                        hidden = True
+        def _all_src(img):
+            """Return first non-data-URI src from common lazy-load attributes."""
+            for attr in ("src", "data-src", "data-lazy-src", "data-original", "data-url"):
+                v = img.get(attr, "")
+                if v and not v.startswith("data:"):
+                    return v
+            return ""
+
+        def _is_hidden(tag):
+            for parent in tag.parents:
+                style = parent.get("style", "") if hasattr(parent, "get") else ""
+                if "display: none" in style or "display:none" in style:
+                    return True
+            return False
+
+        def _good_desc(text):
+            if len(text) < 40:
+                return False
+            bad = ("payment methods", "last update", "general information",
+                   "write a review", "sign up", "site map", "privacy policy",
+                   "terms of", "cookie", "copyright", "all rights reserved",
+                   "related companies", "opening hours", "phone number",
+                   "categories", "social", "directions")
+            tl = text.lower()
+            return not any(b in tl for b in bad)
+
+        # ── LOGO ─────────────────────────────────────────────────────────
+        logo_img = None
+        logo_signals = ("logo", "logos", "thumb_", "profile", "avatar", "brand", "business-img")
+
+        if "nearfinderus" in source:
+            # P1: figure with lazy-element class
+            for fig in soup.find_all("figure"):
+                if any("lazy-element" in c for c in fig.get("class", [])):
+                    img = fig.find("img")
+                    if img and _all_src(img):
+                        logo_img = img
                         break
-                if not hidden:
+            # P2: img src contains /logos/ or /thumb_
+            if not logo_img:
+                for img in soup.find_all("img"):
+                    src = _all_src(img)
+                    if "/logos/" in src or "/thumb_" in src:
+                        logo_img = img
+                        break
+            # P3: any img with logo-like src keywords
+            if not logo_img:
+                for img in soup.find_all("img"):
+                    src = _all_src(img)
+                    if src and any(s in src.lower() for s in logo_signals):
+                        logo_img = img
+                        break
+
+        elif "askmap" in source:
+            # P1: img with logo-like src / class / alt
+            for img in soup.find_all("img"):
+                src = _all_src(img)
+                alt = img.get("alt", "").lower()
+                cls = " ".join(img.get("class", [])).lower()
+                par_cls = " ".join(img.parent.get("class", [])).lower() if img.parent else ""
+                if any(s in src.lower() for s in logo_signals):
+                    logo_img = img; break
+                if any(s in cls + par_cls for s in ("logo", "brand", "business")):
+                    logo_img = img; break
+                if any(s in alt for s in ("logo", "brand")):
+                    logo_img = img; break
+            # P2: first non-tiny, non-icon img
+            if not logo_img:
+                for img in soup.find_all("img"):
+                    src = _all_src(img)
+                    try:
+                        if img.get("width") and int(img.get("width")) < 40:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                    if src and not any(x in src.lower() for x in
+                                       ("icon", "flag", "star", "arrow", "sprite", "banner-ad", "ad-")):
+                        logo_img = img; break
+
+        # Generic fallback
+        if not logo_img:
+            for img in soup.find_all("img"):
+                src = _all_src(img)
+                alt = img.get("alt", "").lower()
+                cls = " ".join(img.get("class", [])).lower()
+                if any(s in src.lower() for s in logo_signals):
+                    logo_img = img; break
+                if any(s in alt for s in ("logo", "brand")):
+                    logo_img = img; break
+                if any(s in cls for s in logo_signals):
+                    logo_img = img; break
+
+        if logo_img:
+            hints["logo_html"] = str(logo_img)
+
+        # ── DESCRIPTION ───────────────────────────────────────────────────
+        if "nearfinderus" in source:
+            # P1: div.mt-4 > visible p
+            for div in soup.find_all("div"):
+                if "mt-4" in " ".join(div.get("class", [])):
+                    for p in div.find_all("p"):
+                        if not _is_hidden(p):
+                            text = p.get_text(separator=" ", strip=True)
+                            if _good_desc(text):
+                                hints["description_text"] = text
+                                break
+                if hints["description_text"]:
+                    break
+            # P2: heading "More about" → next sibling p/div
+            if not hints["description_text"]:
+                for h in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
+                    if "more about" in h.get_text().lower():
+                        for sib in h.find_next_siblings(["p", "div"]):
+                            text = sib.get_text(separator=" ", strip=True)
+                            if _good_desc(text):
+                                hints["description_text"] = text
+                                break
+                        if hints["description_text"]:
+                            break
+            # P3: longest visible p
+            if not hints["description_text"]:
+                best = ""
+                for p in soup.find_all("p"):
+                    if _is_hidden(p):
+                        continue
                     text = p.get_text(separator=" ", strip=True)
-                    if len(text) > 30:
+                    if _good_desc(text) and len(text) > len(best):
+                        best = text
+                hints["description_text"] = best
+
+        elif "askmap" in source:
+            # P1: div/p with description/about/info class
+            for tag in soup.find_all(["div", "p", "section"]):
+                cls = " ".join(tag.get("class", [])).lower()
+                if any(x in cls for x in ("description", "about", "info", "detail", "content")):
+                    text = tag.get_text(separator=" ", strip=True)
+                    if _good_desc(text):
                         hints["description_text"] = text
                         break
+            # P2: longest visible p
+            if not hints["description_text"]:
+                best = ""
+                for p in soup.find_all("p"):
+                    if _is_hidden(p): continue
+                    text = p.get_text(separator=" ", strip=True)
+                    if _good_desc(text) and len(text) > len(best):
+                        best = text
+                hints["description_text"] = best
 
-        # ── Website URL ───────────────────────────────────────────────────
-        # nearfinderus wraps outbound links in /en/empresa/redirect?url=ENCODED
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/empresa/redirect?url=" in href:
-                raw = href.split("url=")[1].split("&")[0]
-                decoded = unquote(raw)
-                # Exclude WhatsApp and internal/social links
-                if "whatsapp.com" not in decoded and "nearfinderus.com" not in decoded:
-                    hints["website_url"] = decoded
-                    break
+        else:
+            # Generic: longest visible p
+            best = ""
+            for p in soup.find_all("p"):
+                if _is_hidden(p): continue
+                text = p.get_text(separator=" ", strip=True)
+                if _good_desc(text) and len(text) > len(best):
+                    best = text
+            hints["description_text"] = best
 
-        # ── Social Media Links ────────────────────────────────────────────
+        # ── WEBSITE URL ───────────────────────────────────────────────────
+        if "nearfinderus" in source:
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/empresa/redirect?url=" in href:
+                    raw = href.split("url=")[1].split("&")[0]
+                    decoded = unquote(raw)
+                    if "whatsapp.com" not in decoded and "nearfinderus.com" not in decoded:
+                        hints["website_url"] = decoded
+                        break
+            # Fallback: first outbound non-social link
+            if not hints["website_url"]:
+                skip = ("nearfinderus.com", "google.com", "facebook.com", "instagram.com",
+                        "twitter.com", "linkedin.com", "whatsapp.com", "youtube.com")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if href.startswith("http") and not any(s in href for s in skip):
+                        hints["website_url"] = href
+                        break
+
+        # ── SOCIAL MEDIA LINKS ────────────────────────────────────────────
+        social_domains = ["whatsapp.com", "facebook.com", "instagram.com",
+                          "linkedin.com", "twitter.com", "x.com", "youtube.com", "tiktok.com"]
         social_links = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/empresa/redirect?url=" in href:
-                raw = href.split("url=")[1].split("&")[0]
-                decoded = unquote(raw)
-                if any(s in decoded for s in ["whatsapp.com", "facebook.com", "instagram.com",
-                                               "linkedin.com", "twitter.com", "youtube.com", "tiktok.com"]):
-                    social_links.append(decoded)
+        if "nearfinderus" in source:
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/empresa/redirect?url=" in href:
+                    raw = href.split("url=")[1].split("&")[0]
+                    decoded = unquote(raw)
+                    if any(s in decoded for s in social_domains):
+                        social_links.append(decoded)
+        else:
+            for a in soup.find_all("a", href=True):
+                if any(s in a["href"] for s in social_domains):
+                    social_links.append(a["href"])
         if social_links:
-            hints["social_links"] = ", ".join(social_links)
+            hints["social_links"] = ", ".join(dict.fromkeys(social_links))
 
-        # ── GBP Link ──────────────────────────────────────────────────────
+        # ── GBP LINK ──────────────────────────────────────────────────────
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if "google.com" in href and "maps/place" in href:
+            if "google.com" in href and any(p in href for p in ("maps/place", "maps?q", "goo.gl")):
                 hints["gbp_link"] = href
                 break
 
@@ -121,7 +256,7 @@ def _extract_nearfinder_hints(page_html: str, page_text: str) -> dict:
     return hints
 
 
-def build_prompt(page_text: str, page_html: str, fields: list) -> str:
+def build_prompt(page_text: str, page_html: str, fields: list, source: str = "") -> str:
     """
     Build a generic extraction prompt.
     Gemini searches the entire page content for each requested field.
@@ -130,7 +265,7 @@ def build_prompt(page_text: str, page_html: str, fields: list) -> str:
     import re as _re
 
     # Pre-extract structured values from HTML using BeautifulSoup
-    hints = _extract_nearfinder_hints(page_html, page_text)
+    hints = _extract_page_hints(page_html, page_text, source)
 
     # Extract ALL img tags from full HTML — for logo/photo detection
     all_img_tags = _re.findall(r'<img[^>]*>', page_html, flags=_re.IGNORECASE)
@@ -324,7 +459,7 @@ def extract_fields(
     page_text: str, page_html: str, fields: list, source: str, api_key: str
 ) -> dict:
     client = genai.Client(api_key=api_key)
-    prompt = build_prompt(page_text, page_html, fields)
+    prompt = build_prompt(page_text, page_html, fields, source)
 
     raw = ""
     model_used = ""
