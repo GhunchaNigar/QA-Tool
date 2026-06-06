@@ -23,6 +23,18 @@ JS_RENDER_FIRST_DOMAINS = [
     "band.us",
 ]
 
+# Per-domain render settings: wait (ms) and CSS selector to wait for
+JS_RENDER_CONFIG = {
+    "nearfinderus.com": {
+        "wait": "20000",
+        "wait_for_selector": "h1",
+    },
+    "us.enrollbusiness.com": {
+        "wait": "15000",
+        "wait_for_selector": "h1",
+    },
+}
+
 def _get_attempt_order(url: str) -> list:
     """Return scrape attempt order — JS-heavy sites get render=true first."""
     url_lower = url.lower()
@@ -65,8 +77,9 @@ def _is_thin(text: str, min_chars: int = 200) -> bool:
 
 def _parse(html: str) -> tuple:
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "iframe", "svg",
-                     "header", "footer", "nav"]):
+    # Do NOT strip header/nav — some directories (e.g. nearfinderus) put the
+    # business logo and key info inside those elements.
+    for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
         tag.decompose()
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
     text  = soup.get_text(separator="\n", strip=True)
@@ -76,7 +89,7 @@ def _parse(html: str) -> tuple:
 
 # ── Layer 1: ScraperAPI ───────────────────────────────────────────────────────
 
-def _scraperapi_fetch(url, api_key, render, premium=False, timeout=70):
+def _scraperapi_fetch(url, api_key, render, premium=False, timeout=90):
     from urllib.parse import quote, urlencode
     # Manually encode the target URL to preserve special chars like +
     # Using requests params= would corrupt + signs causing HTTP 500
@@ -88,9 +101,16 @@ def _scraperapi_fetch(url, api_key, render, premium=False, timeout=70):
         "keep_headers": "true",
     }
     if render:
-        # Wait 8s for JS-heavy pages to lazy-load images and expand hidden sections
-        qs["wait_for_selector"] = "body"
-        qs["wait"] = "12000"
+        # Use per-domain config if available, else generic defaults
+        url_lower = url.lower()
+        domain_cfg = next(
+            (cfg for domain, cfg in JS_RENDER_CONFIG.items() if domain in url_lower),
+            {"wait": "12000", "wait_for_selector": "body"},
+        )
+        qs["wait_for_selector"] = domain_cfg["wait_for_selector"]
+        qs["wait"] = domain_cfg["wait"]
+        # Bump request timeout to exceed the wait time
+        timeout = max(timeout, int(domain_cfg["wait"]) // 1000 + 30)
     if premium:
         qs["premium"] = "true"
     full_url = f"{SCRAPERAPI_ENDPOINT}?{urlencode(qs)}&url={encoded_url}"
