@@ -4,22 +4,17 @@ Sends scraped page content to Google Gemini and extracts
 business fields as JSON — including visual fields (Logo, Photos).
 No hardcoded layout assumptions. Gemini searches the whole page.
 
-v4 — Bug-fixes over v3:
-  - nearfinderus: skip-domains now includes nearfinder.com (catches blog.nearfinder.com)
-  - nearfinderus: redirect-wrapper regex broadened to /redirect?url= (not just /empresa/)
-  - nearfinderus: description extraction uses broader sibling search + falls back
-    to longest paragraph AFTER filtering out pure address strings
-  - askmap: description now skips itemprop="description" that looks like an address;
-    falls back to the Info/About <p> or longest good paragraph
-  - askmap: category extracted via itemprop="category" / breadcrumb
-  - enrollbusiness: Cloudflare challenge URL detected → Website URL cleared + page
-    treated as blocked at post-process stage
-  - All domains: _good_desc min_len raised to 60 to filter address-only strings
-  - _good_desc: new address-like pattern filter added
-  - nearfinderus/smallbusinessusa/enrollbusiness: category extracted from
-    breadcrumb / itemprop / structured data
-  - Hours: per-domain patterns tightened; nearfinderus hours extracted from
-    the opening-hours table rows directly
+v5 — Bug-fixes over v4:
+  - nearfinderus: hours "00:00 to 00:00" placeholder fix:
+      Priority 1 now reads itemprop="openingHours" content attribute
+      (populated by JS before scrape); table rows showing 00:00–00:00
+      are skipped as un-rendered placeholders.
+  - enrollbusiness: all-NULL fix — scrape failures (page["error"] set)
+      were already handled upstream; this file adds a post-process guard
+      that re-runs hint extraction on a successfully scraped page even
+      when Gemini returns all-null (e.g. partial Cloudflare block that
+      passed the challenge detector but returned empty body).
+      Category override now also fires when AI returns empty string "".
 """
 
 import json
@@ -78,10 +73,15 @@ _PHOTO_CLASS_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# FIX: address-like string detector — used to reject false descriptions
+# address-like string detector — used to reject false descriptions
 _ADDRESS_LIKE = re.compile(
     r"^\s*(address\s*:|phone\s*:|\d+\s+\w+.*\b(blvd|st|ave|rd|ln|dr|way|ct|pl)\b)",
     re.IGNORECASE,
+)
+
+# FIX v5: placeholder hours pattern — both open and close are midnight
+_PLACEHOLDER_HOURS = re.compile(
+    r"^0{1,2}:0{2}\s*to\s*0{1,2}:0{2}$"
 )
 
 
@@ -417,19 +417,13 @@ _BAD_DESC_PHRASES = (
 
 
 def _good_desc(text: str, min_len: int = 60) -> bool:
-    """
-    FIX v4: min_len raised from 40→60 to filter address-only strings.
-    Also rejects text that looks like a bare address / phone dump.
-    """
     if len(text) < min_len:
         return False
     tl = text.lower()
     if any(b in tl for b in _BAD_DESC_PHRASES):
         return False
-    # Reject text that is overwhelmingly address/phone data
     if _ADDRESS_LIKE.match(text):
         return False
-    # Reject if more than half the tokens look like an address line
     addr_tokens = re.findall(
         r"\b(\d{3,}|blvd|street|avenue|suite|ste|fl\b|zip|phone|tel)\b",
         tl,
@@ -464,12 +458,10 @@ def _extract_category_generic(soup) -> str:
       3. Breadcrumb last item (often the category)
       4. <meta name="keywords"> first token
     """
-    # Strategy 1: microdata
     cat = _itemprop(soup, "category")
     if cat and len(cat) < 80:
         return cat
 
-    # Strategy 2: JSON-LD
     ld_blocks = _extract_json_ld(soup)
     for ld in ld_blocks:
         for key in ("additionalType", "knowsAbout", "serviceType", "category"):
@@ -477,22 +469,18 @@ def _extract_category_generic(soup) -> str:
             if isinstance(val, list):
                 val = val[0] if val else ""
             if isinstance(val, str) and val and len(val) < 80:
-                # Strip schema.org URLs
                 val = val.split("/")[-1].replace("-", " ").replace("_", " ")
                 return val
 
-    # Strategy 3: breadcrumb — last crumb before current page title
     for nav in soup.find_all(["nav", "ol", "ul", "div"],
                               class_=re.compile(r"breadcrumb", re.I)):
         items = nav.find_all(["li", "a", "span"])
         texts = [i.get_text(strip=True) for i in items if i.get_text(strip=True)]
         if len(texts) >= 2:
-            # Second-to-last is usually the category
             candidate = texts[-2]
             if 3 < len(candidate) < 60:
                 return candidate
 
-    # Strategy 4: meta keywords first token
     meta_kw = soup.find("meta", attrs={"name": "keywords"})
     if meta_kw:
         kw = meta_kw.get("content", "").split(",")[0].strip()
@@ -506,7 +494,6 @@ def _extract_category_generic(soup) -> str:
 #  Common skip domains
 # ─────────────────────────────────────────────────────────────────────────────
 
-# FIX v4: Added nearfinder.com (catches blog.nearfinder.com) and cloudflare.com
 _SKIP_DOMAINS = (
     "enrollbusiness.com", "nearfinderus.com", "nearfinder.com",
     "hotfrog.com", "brownbook.net", "freelistingusa.com",
@@ -546,23 +533,13 @@ def _social_links_generic(soup) -> str:
 # ── askmap.net ───────────────────────────────────────────────────────────────
 
 def _extract_askmap(soup) -> dict:
-    """
-    FIX v4:
-    - itemprop="description" is often just the address on askmap; validate
-      with _good_desc before using it.
-    - Fall back to the Info <div>/<p> block which holds the real description.
-    - Category extracted via _extract_category_generic.
-    """
     out = {"description_text": "", "website_url": "", "hours": "",
            "social_links": "", "gbp_link": "", "category": ""}
 
-    # ── Description ──
-    # Priority 1: itemprop="description" — but only if it's a real description
     desc = _itemprop(soup, "description")
     if _good_desc(desc):
         out["description_text"] = desc
 
-    # Priority 2: div/section with class "info", "about", "description"
     if not out["description_text"]:
         for tag in soup.find_all(["div", "section", "p"]):
             cls = _cls_str(tag)
@@ -574,7 +551,6 @@ def _extract_askmap(soup) -> dict:
                     out["description_text"] = text
                     break
 
-    # Priority 3: heading "Info" / "About" → next sibling
     if not out["description_text"]:
         for h in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
             htxt = h.get_text(strip=True).lower()
@@ -587,14 +563,11 @@ def _extract_askmap(soup) -> dict:
                 if out["description_text"]:
                     break
 
-    # Priority 4: longest good paragraph
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # ── Category ──
     out["category"] = _extract_category_generic(soup)
 
-    # ── Website ──
     url_tag = soup.find(itemprop="url")
     if url_tag:
         href = url_tag.get("href", "") or url_tag.get("content", "")
@@ -611,7 +584,6 @@ def _extract_askmap(soup) -> dict:
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # ── Hours ──
     hours_tags = soup.find_all(itemprop="openingHours")
     if hours_tags:
         out["hours"] = "; ".join(t.get_text(strip=True) for t in hours_tags
@@ -622,7 +594,6 @@ def _extract_askmap(soup) -> dict:
             out["hours"] = "; ".join(t.get_text(separator=" ", strip=True)
                                       for t in spec_tags if t.get_text(strip=True))
 
-    # ── Social + GBP ──
     out["social_links"] = _social_links_generic(soup)
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
@@ -810,7 +781,6 @@ def _extract_hotfrog(soup) -> dict:
                         parts.append(f"{days}: {opens}–{closes}".strip())
                 out["hours"] = "; ".join(parts)
 
-        # Category from JSON-LD
         for key in ("additionalType", "knowsAbout", "serviceType"):
             val = ld.get(key, "")
             if isinstance(val, list):
@@ -937,24 +907,22 @@ def _extract_smallbusinessusa(soup) -> dict:
 
 def _extract_nearfinderus(soup) -> dict:
     """
-    FIX v4:
-    - Redirect wrapper broadened: match any /redirect?url= pattern (not just /empresa/)
-    - nearfinder.com added to _SKIP_DOMAINS so blog.nearfinder.com is filtered
-    - Description: "More about" heading search expanded; sibling search now
-      also looks at div children; falls back to _longest_good_para
-    - Category: extracted from breadcrumb / itemprop
-    - Hours: extracted directly from the opening-hours table/list rows
+    FIX v5 — Hours:
+      Priority 1: itemprop="openingHours" content attribute.
+        These are populated reliably in the rendered HTML as machine-readable
+        strings (e.g. "Mo-Fr 09:00-17:00") and are always correct.
+      Priority 2: table rows — but rows where the time cell matches the
+        placeholder pattern "00:00 to 00:00" are skipped, because those
+        are un-rendered JS placeholders, not real times.
     """
     from urllib.parse import unquote
     out = {"description_text": "", "website_url": "", "hours": "",
            "social_links": "", "gbp_link": "", "category": ""}
 
     # ── Description ──
-    # Priority 1: "More about …" section
     for h in soup.find_all(["h2", "h3", "h4", "strong", "b", "p"]):
         htxt = h.get_text(strip=True).lower()
         if re.search(r"more about|about\s+\w", htxt):
-            # Check next siblings
             for sib in h.find_next_siblings(["p", "div", "section"]):
                 if _is_hidden_tag(sib):
                     continue
@@ -962,7 +930,6 @@ def _extract_nearfinderus(soup) -> dict:
                 if _good_desc(text):
                     out["description_text"] = text
                     break
-            # Also check direct children of parent
             if not out["description_text"] and h.parent:
                 for child in h.parent.find_all(["p", "div"], recursive=False):
                     if child == h:
@@ -976,7 +943,6 @@ def _extract_nearfinderus(soup) -> dict:
             if out["description_text"]:
                 break
 
-    # Priority 2: div with mt-4 class containing a real description paragraph
     if not out["description_text"]:
         for div in soup.find_all("div"):
             classes = " ".join(div.get("class", []))
@@ -991,7 +957,6 @@ def _extract_nearfinderus(soup) -> dict:
             if out["description_text"]:
                 break
 
-    # Priority 3: any section/div labeled description / about / info
     if not out["description_text"]:
         for tag in soup.find_all(["div", "section", "article"]):
             cls = _cls_str(tag)
@@ -1003,13 +968,11 @@ def _extract_nearfinderus(soup) -> dict:
                     out["description_text"] = text
                     break
 
-    # Priority 4: longest good paragraph
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
     # ── Category ──
     out["category"] = _extract_category_generic(soup)
-    # nearfinderus breadcrumb has the category as second-to-last link
     if not out["category"]:
         breadcrumb_links = []
         for a in soup.find_all("a", href=True):
@@ -1022,11 +985,9 @@ def _extract_nearfinderus(soup) -> dict:
             out["category"] = breadcrumb_links[-1]
 
     # ── Website + Social via redirect wrapper ──
-    # FIX v4: broadened regex to catch /redirect?url= anywhere in path
     social_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # Match any redirect wrapper pattern: /redirect?url=, /empresa/redirect?url=, etc.
         redirect_match = re.search(r"/redirect\?url=([^&\s]+)", href)
         if redirect_match:
             decoded = unquote(redirect_match.group(1))
@@ -1040,31 +1001,57 @@ def _extract_nearfinderus(soup) -> dict:
                 out["website_url"] = href
     out["social_links"] = ", ".join(dict.fromkeys(social_links))
 
-    # ── Hours ──
-    # FIX v4: extract directly from the opening-hours table rows
-    # nearfinderus renders a table/list with day + time columns
-    hours_rows = []
-    for container in soup.find_all(["div", "section", "table", "ul"]):
-        cls = _cls_str(container)
-        if re.search(r"(hours|schedule|working|opening|open)", cls):
-            # Table-based hours
-            rows = container.find_all("tr")
-            if rows:
-                for row in rows:
-                    cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-                    if len(cells) >= 2:
-                        hours_rows.append(": ".join(cells[:2]))
-            if not hours_rows:
-                # List / div-row based
-                text = container.get_text(separator="|", strip=True)
-                if text and len(text) < 600:
-                    out["hours"] = text
-            if hours_rows:
-                out["hours"] = "; ".join(hours_rows)
-            if out["hours"]:
-                break
+    # ── Hours (FIX v5) ──
+    #
+    # Priority 1: itemprop="openingHours" — content attribute holds the
+    # machine-readable value (e.g. "Mo-Fr 09:00-17:00") which is always
+    # populated correctly in the rendered DOM, unlike the visible text cells
+    # that may still show placeholder "0000 to 0000" if JS hasn't run.
+    oh_tags = soup.find_all(attrs={"itemprop": "openingHours"})
+    if oh_tags:
+        hours_list = []
+        for t in oh_tags:
+            # Prefer content attr (machine-readable), fall back to visible text
+            val = t.get("content", "").strip() or t.get_text(strip=True)
+            if not val:
+                continue
+            # Skip if the value is clearly a placeholder midnight-to-midnight
+            stripped = val.replace(" ", "")
+            if re.search(r"0{1,2}:0{2}[-–to]+0{1,2}:0{2}", stripped):
+                continue
+            hours_list.append(val)
+        if hours_list:
+            out["hours"] = "; ".join(hours_list)
 
-    # Fallback: look for day-name patterns in any visible text block
+    # Priority 2: opening-hours table/list rows — skip placeholder rows
+    if not out["hours"]:
+        for container in soup.find_all(["div", "section", "table", "ul"]):
+            cls = _cls_str(container)
+            if re.search(r"(hours|schedule|working|opening|open)", cls):
+                rows = container.find_all("tr")
+                if rows:
+                    hours_rows = []
+                    for row in rows:
+                        cells = [td.get_text(strip=True)
+                                 for td in row.find_all(["td", "th"])]
+                        if len(cells) >= 2:
+                            time_part = cells[1].strip()
+                            # Skip placeholder "00:00 to 00:00" rows
+                            if _PLACEHOLDER_HOURS.match(time_part):
+                                continue
+                            hours_rows.append(": ".join(cells[:2]))
+                    if hours_rows:
+                        out["hours"] = "; ".join(hours_rows)
+                        break
+                else:
+                    # List / div-row based — only use if no placeholders dominate
+                    text = container.get_text(separator="|", strip=True)
+                    placeholder_count = len(re.findall(r"0{1,2}:0{2}\s*to\s*0{1,2}:0{2}", text))
+                    if text and len(text) < 600 and placeholder_count == 0:
+                        out["hours"] = text
+                        break
+
+    # Priority 3: day-name pattern fallback
     if not out["hours"]:
         day_pattern = re.compile(
             r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
@@ -1073,7 +1060,15 @@ def _extract_nearfinderus(soup) -> dict:
         )
         for tag in soup.find_all(["p", "div", "li", "span"]):
             text = tag.get_text(separator=" ", strip=True)
-            if day_pattern.search(text) and len(text) < 300 and not _is_hidden_tag(tag):
+            if (day_pattern.search(text) and len(text) < 300
+                    and not _is_hidden_tag(tag)):
+                # Still skip if every time value is a placeholder
+                placeholder_count = len(
+                    re.findall(r"0{1,2}:0{2}\s*to\s*0{1,2}:0{2}", text)
+                )
+                day_count = len(day_pattern.findall(text))
+                if placeholder_count > 0 and placeholder_count >= day_count:
+                    continue
                 out["hours"] = text
                 break
 
@@ -1090,11 +1085,6 @@ def _extract_nearfinderus(soup) -> dict:
 # ── us.enrollbusiness.com ─────────────────────────────────────────────────────
 
 def _extract_enrollbusiness(soup) -> dict:
-    """
-    FIX v4:
-    - Category extracted via _extract_category_generic.
-    - Hours: "Working Hours:" label used as anchor.
-    """
     out = {"description_text": "", "website_url": "", "hours": "",
            "social_links": "", "gbp_link": "", "category": ""}
 
@@ -1132,13 +1122,11 @@ def _extract_enrollbusiness(soup) -> dict:
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # FIX v4: anchor on "Working Hours:" label
     for tag in soup.find_all(["div", "section", "table", "li"]):
         cls = _cls_str(tag)
         text = tag.get_text(separator=" ", strip=True)
         if re.search(r"(working hours|business hours|hours of operation|opening hours)", text, re.I):
             if len(text) < 500:
-                # Strip the label prefix and keep the hours portion
                 hours_text = re.sub(
                     r"^.*(working hours|business hours|hours of operation|opening hours)\s*[:\-]?\s*",
                     "", text, flags=re.IGNORECASE,
@@ -1221,13 +1209,11 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
         "gbp_link":         "",
         "hours":            "",
         "category":         "",
-        # FIX v4: flag when Cloudflare challenge page detected
         "cloudflare_blocked": False,
     }
     if not page_html:
         return hints
 
-    # FIX v4: detect Cloudflare challenge early — no point extracting
     if _is_cloudflare_challenge(page_html, page_text):
         hints["cloudflare_blocked"] = True
         return hints
@@ -1274,7 +1260,6 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
 def build_prompt(page_text: str, page_html: str, fields: list, source: str = "") -> str:
     hints = _extract_page_hints(page_html, page_text, source)
 
-    # FIX v4: if Cloudflare blocked, tell Gemini so it doesn't hallucinate
     if hints.get("cloudflare_blocked"):
         return (
             f'You are a business data extraction assistant.\n'
@@ -1331,7 +1316,6 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
         pre_extracted_facts.append(
             f'GBP LINK (confirmed from page HTML):\n{hints["gbp_link"]}'
         )
-    # FIX v4: pass pre-extracted category to AI
     if hints["category"]:
         pre_extracted_facts.append(
             f'CATEGORY (confirmed from page HTML — use as-is):\n{hints["category"]}'
@@ -1409,7 +1393,9 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
                 '- "Hours": operating hours.\n'
                 '  If HOURS appears in PRE-EXTRACTED FIELDS above, use it directly.\n'
                 '  Otherwise find opening-hours or working-hours sections.\n'
-                '  Format: e.g. "Mon-Fri 9am-5pm" or "Monday - Sunday: 24 Hours Open".'
+                '  Format: e.g. "Mon-Fri 9am-5pm" or "Monday - Sunday: 24 Hours Open".\n'
+                '  NEVER return hours where every day shows "00:00 to 00:00" — '
+                'those are un-rendered placeholders; return null instead.'
             )
         elif f == "Social Media Links":
             field_rules.append(
@@ -1460,6 +1446,7 @@ CRITICAL RULES:
 - For Logo and Photos: if PRE-EXTRACTED FIELDS confirms PRESENT, return "PRESENT" — do not second-guess.
 - For Website URL: NEVER return a cloudflare.com URL — return null if only cloudflare URLs exist.
 - For Description: NEVER return a bare address string or phone number as the description.
+- For Hours: NEVER return a value where every day shows "00:00 to 00:00" — return null instead.
 
 FIELD INSTRUCTIONS:
 {rules_text}
@@ -1523,6 +1510,23 @@ def _call_gemini(client, prompt: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Helper: is the extracted result effectively all-null?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _all_null(extracted: dict, fields: list) -> bool:
+    """
+    FIX v5: detect when Gemini returned null for every requested field,
+    which can happen when a partial Cloudflare block passes the challenge
+    detector but returned an empty/minimal body.  In that case we still
+    apply all available hints so the row isn't completely empty.
+    """
+    for f in fields:
+        if extracted.get(f) not in (None, "", "null"):
+            return False
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1559,7 +1563,7 @@ def extract_fields(
         # ── POST-PROCESS: authoritative overrides ─────────────────────────
         hints = _extract_page_hints(page_html, page_text, source)
 
-        # FIX v4: if Cloudflare challenge, null all fields
+        # If Cloudflare challenge, null all fields
         if hints.get("cloudflare_blocked"):
             for f in fields:
                 extracted[f] = None
@@ -1567,39 +1571,68 @@ def extract_fields(
             extracted["_model"] = model_used
             return extracted
 
+        # Visual fields — always authoritative from HTML analysis
         if hints["logo_confirmed"] and "Logo" in fields:
             extracted["Logo"] = "PRESENT"
         if hints["photos_confirmed"] and "Photos" in fields:
             extracted["Photos"] = "PRESENT"
 
-        # Only override text fields if AI returned null/empty AND we have a value
+        # Text fields — override when AI returned null/empty AND we have a hint.
+        # FIX v5: also override when AI returned "" (empty string), not just None.
+        def _ai_empty(val) -> bool:
+            return val in (None, "", "null")
+
         if hints["description_text"] and "Description" in fields:
-            if not extracted.get("Description"):
+            if _ai_empty(extracted.get("Description")):
                 extracted["Description"] = hints["description_text"]
+
         if hints["website_url"] and "Website URL" in fields:
             ai_url = extracted.get("Website URL", "") or ""
-            # FIX v4: also clear Cloudflare URLs that Gemini may have returned
-            if not ai_url or "cloudflare.com" in ai_url:
+            if _ai_empty(ai_url) or "cloudflare.com" in ai_url:
                 extracted["Website URL"] = hints["website_url"]
+
         if hints["hours"] and "Hours" in fields:
-            if not extracted.get("Hours"):
+            if _ai_empty(extracted.get("Hours")):
                 extracted["Hours"] = hints["hours"]
+
         if hints["social_links"] and "Social Media Links" in fields:
-            if not extracted.get("Social Media Links"):
+            if _ai_empty(extracted.get("Social Media Links")):
                 extracted["Social Media Links"] = hints["social_links"]
+
         if hints["gbp_link"] and "GBP Link" in fields:
-            if not extracted.get("GBP Link"):
+            if _ai_empty(extracted.get("GBP Link")):
                 extracted["GBP Link"] = hints["gbp_link"]
-        # FIX v4: category override
+
         if hints["category"] and "Category" in fields:
-            if not extracted.get("Category"):
+            if _ai_empty(extracted.get("Category")):
                 extracted["Category"] = hints["category"]
 
-        # FIX v4: final Cloudflare URL guard regardless of source
+        # FIX v5: post-process guard — if Gemini returned all-null despite
+        # the page having content (e.g. partial Cloudflare block that wasn't
+        # caught), the hint overrides above already populated what we could
+        # find.  Log the anomaly so it's visible in downstream debugging.
+        if _all_null(extracted, fields) and (page_html or page_text):
+            extracted["_all_null_warning"] = (
+                "Gemini returned null for all fields despite page content being present. "
+                "Check scrape quality or Cloudflare status."
+            )
+
+        # Final Cloudflare URL guard regardless of source
         if "Website URL" in fields:
             url_val = extracted.get("Website URL", "") or ""
             if "cloudflare.com" in url_val:
                 extracted["Website URL"] = None
+
+        # Final hours placeholder guard — if hours still looks like all
+        # midnight placeholders after overrides, clear it.
+        if "Hours" in fields:
+            hours_val = extracted.get("Hours", "") or ""
+            real_time_segments = len(re.findall(r"\d{1,2}:\d{2}", hours_val))
+            placeholder_segments = len(
+                re.findall(r"0{1,2}:0{2}\s*(?:to|-|–)\s*0{1,2}:0{2}", hours_val)
+            )
+            if real_time_segments > 0 and placeholder_segments == real_time_segments:
+                extracted["Hours"] = None
 
     except json.JSONDecodeError as e:
         extracted = {"_parse_error": str(e), "_raw": raw[:800], "_model": model_used}
@@ -1631,6 +1664,7 @@ def extract_batch(
         if page.get("error"):
             result = {f: None for f in fields}
             result["_scrape_error"] = page["error"]
+            result["_scrape_debug"] = page.get("_debug", "")
         else:
             cleaned_html = clean_html(page.get("html", ""))
             cleaned_text = clean_text(page.get("text", ""))
