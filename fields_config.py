@@ -42,7 +42,7 @@ SOURCE_FIELDS = {
     ],
     "askmap.net":[
         "Name",	"Street",	"City",	"State",	"Zipcode",
-        "Phone",	"Website URL",	"Keywords",	"Description", "Hours"
+        "Phone",	"Website URL",	"Keywords",	"Description", "Hours",
         "Category",	"Logo"
     ]
 }
