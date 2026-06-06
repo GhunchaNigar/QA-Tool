@@ -46,8 +46,8 @@ STATIC_DOMAINS = [
 # Per-domain render settings: wait (ms) and CSS selector to wait for
 JS_RENDER_CONFIG = {
     "nearfinderus.com": {
-    "wait": "30000",
-    "wait_for_selector": "main",
+        "wait": "20000",
+        "wait_for_selector": "h1",
     },
     "us.enrollbusiness.com": {
         "wait": "18000",
