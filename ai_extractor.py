@@ -4,23 +4,22 @@ Sends scraped page content to Google Gemini and extracts
 business fields as JSON — including visual fields (Logo, Photos).
 No hardcoded layout assumptions. Gemini searches the whole page.
 
-v3 — Full per-domain extraction for all 7 supported directories:
-     askmap.net · brownbook.net · freelistingusa.com · hotfrog.com
-     nearfinderus.com · smallbusinessusa.com · us.enrollbusiness.com
-
-Key improvements over v2:
-  - JSON-LD extraction layer (hotfrog, brownbook, freelistingusa all use it)
-  - schema.org microdata extraction (askmap, brownbook)
-  - Per-domain description / website / hours / social extractors for the
-    4 previously unhandled domains
-  - askmap website URL now extracted correctly via itemprop="url" / rel=nofollow
-  - brownbook: itemprop-based extraction for all core fields
-  - freelistingusa: listing-description div + schema.org fallback
-  - hotfrog: JSON-LD primary path, DOM fallback
-  - smallbusinessusa: business-description / about div paths
-  - Hours field added to hints (pre-extracted and authoritative)
-  - _detect_logo / _detect_photos: brownbook itemprop="image" strategy added
-  - Redirect guard mirrors scraper.py's REDIRECT_SIGNALS
+v4 — Bug-fixes over v3:
+  - nearfinderus: skip-domains now includes nearfinder.com (catches blog.nearfinder.com)
+  - nearfinderus: redirect-wrapper regex broadened to /redirect?url= (not just /empresa/)
+  - nearfinderus: description extraction uses broader sibling search + falls back
+    to longest paragraph AFTER filtering out pure address strings
+  - askmap: description now skips itemprop="description" that looks like an address;
+    falls back to the Info/About <p> or longest good paragraph
+  - askmap: category extracted via itemprop="category" / breadcrumb
+  - enrollbusiness: Cloudflare challenge URL detected → Website URL cleared + page
+    treated as blocked at post-process stage
+  - All domains: _good_desc min_len raised to 60 to filter address-only strings
+  - _good_desc: new address-like pattern filter added
+  - nearfinderus/smallbusinessusa/enrollbusiness: category extracted from
+    breadcrumb / itemprop / structured data
+  - Hours: per-domain patterns tightened; nearfinderus hours extracted from
+    the opening-hours table rows directly
 """
 
 import json
@@ -38,7 +37,6 @@ GEMINI_MODELS = [
     "gemini-1.5-flash",
     "gemini-1.5-flash-latest",
 ]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Image-quality helpers
@@ -80,9 +78,14 @@ _PHOTO_CLASS_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# FIX: address-like string detector — used to reject false descriptions
+_ADDRESS_LIKE = re.compile(
+    r"^\s*(address\s*:|phone\s*:|\d+\s+\w+.*\b(blvd|st|ave|rd|ln|dr|way|ct|pl)\b)",
+    re.IGNORECASE,
+)
+
 
 def _all_srcs(tag) -> list:
-    """Return all non-data-URI image URLs from a tag, checking every lazy-load variant."""
     attrs = ("src", "data-src", "data-lazy", "data-lazy-src",
              "data-original", "data-url", "data-image",
              "data-bg", "data-background", "data-srcset")
@@ -166,14 +169,10 @@ def _is_hidden_tag(tag) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  JSON-LD extractor  (hotfrog, brownbook, freelistingusa all embed it)
+#  JSON-LD extractor
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_json_ld(soup) -> list:
-    """
-    Parse all <script type="application/ld+json"> blocks on the page.
-    Returns a list of dicts (may be empty).
-    """
     results = []
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -192,10 +191,6 @@ def _extract_json_ld(soup) -> list:
 
 
 def _ld_find(ld_blocks: list, *types_) -> dict:
-    """
-    Return the first JSON-LD block whose @type matches one of types_.
-    Types are matched case-insensitively and support partial match.
-    """
     type_lower = [t.lower() for t in types_]
     for block in ld_blocks:
         bt = block.get("@type", "")
@@ -207,7 +202,6 @@ def _ld_find(ld_blocks: list, *types_) -> dict:
 
 
 def _ld_address(ld: dict) -> dict:
-    """Extract address sub-fields from a JSON-LD LocalBusiness block."""
     addr = ld.get("address", {})
     if isinstance(addr, str):
         return {}
@@ -221,17 +215,10 @@ def _ld_address(ld: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  schema.org microdata extractor  (askmap, brownbook)
+#  schema.org microdata extractor
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _itemprop(soup, prop: str, attr: str = "text") -> str:
-    """
-    Find the first element with itemprop=prop.
-    attr='text'    → returns .get_text(strip=True)
-    attr='content' → returns the content= attribute (meta tags)
-    attr='href'    → returns the href= attribute
-    attr='src'     → returns the src= attribute
-    """
     tag = soup.find(itemprop=prop)
     if tag is None:
         return ""
@@ -241,7 +228,6 @@ def _itemprop(soup, prop: str, attr: str = "text") -> str:
 
 
 def _itemprop_all(soup, prop: str) -> list:
-    """Return get_text for ALL elements with itemprop=prop."""
     return [t.get_text(strip=True) for t in soup.find_all(itemprop=prop)]
 
 
@@ -250,28 +236,20 @@ def _itemprop_all(soup, prop: str) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_logo(soup, source: str = "") -> str:
-    """
-    Multi-strategy logo detection.
-    Returns the img tag HTML string, or "" if not found.
-    """
     source_lower = source.lower()
 
-    # ── Strategy 0 (NEW): schema.org itemprop="image" ─────────────────────
-    # brownbook and askmap use microdata; the primary image IS the logo.
     if any(d in source_lower for d in ("brownbook", "askmap")):
         img = soup.find("img", itemprop="image")
         if img:
             srcs = _all_srcs(img)
             if srcs and not _is_tiny(img, 20):
                 return str(img)
-        # Also check meta itemprop="image" (content= attribute)
         meta_img = soup.find("meta", itemprop="image")
         if meta_img:
             content = meta_img.get("content", "").strip()
             if content and content.startswith("http"):
                 return f'<img src="{content}" data-source="itemprop:image">'
 
-    # ── Strategy 0b (NEW): JSON-LD logo field ─────────────────────────────
     ld_blocks = _extract_json_ld(soup)
     ld = _ld_find(ld_blocks, "LocalBusiness", "Organization", "Store", "Restaurant")
     if ld:
@@ -281,13 +259,11 @@ def _detect_logo(soup, source: str = "") -> str:
         if isinstance(logo_val, str) and logo_val.startswith("http"):
             return f'<img src="{logo_val}" data-source="json-ld:logo">'
 
-    # ── Strategy 1: src attribute matches logo patterns ───────────────────
     for img in soup.find_all("img"):
         for src in _all_srcs(img):
             if _LOGO_SRC_PATTERNS.search(src) and not _is_tiny(img, 20):
                 return str(img)
 
-    # ── Strategy 2: img class / id / alt contains logo signals ───────────
     for img in soup.find_all("img"):
         img_cls = _cls_str(img)
         alt = img.get("alt", "").lower()
@@ -297,7 +273,6 @@ def _detect_logo(soup, source: str = "") -> str:
             if srcs and not _is_tiny(img, 20):
                 return str(img)
 
-    # ── Strategy 3: parent/ancestor container has logo class ─────────────
     for img in soup.find_all("img"):
         anc = _ancestor_cls(img, depth=5)
         if _LOGO_CLASS_PATTERNS.search(anc):
@@ -305,7 +280,6 @@ def _detect_logo(soup, source: str = "") -> str:
             if srcs and not _is_tiny(img, 20) and not _is_ui_image(srcs[0]):
                 return str(img)
 
-    # ── Strategy 4: overlay/circular logo (enrollbusiness pattern) ────────
     overlay_signals = re.compile(
         r"(profile|thumb|overlay|circle|round|badge|seal|"
         r"business[-_]?icon|company[-_]?icon|listing[-_]?icon)",
@@ -319,7 +293,6 @@ def _detect_logo(soup, source: str = "") -> str:
                 if srcs and not _is_tiny(img, 30) and not _is_ui_image(srcs[0]):
                     return str(img)
 
-    # ── Strategy 5: enrollbusiness hero second-img is the overlay logo ────
     if "enrollbusiness" in source_lower:
         hero_signals = re.compile(
             r"(hero|banner|cover|carousel|slider|featured|"
@@ -334,7 +307,6 @@ def _detect_logo(soup, source: str = "") -> str:
                     if srcs and not _is_tiny(img, 30) and not _is_ui_image(srcs[0]):
                         return str(img)
 
-    # ── Strategy 6: meta og:image as last resort ──────────────────────────
     og = (soup.find("meta", property="og:image") or
           soup.find("meta", attrs={"name": "og:image"}))
     if og and og.get("content", "").startswith("http"):
@@ -348,12 +320,8 @@ def _detect_logo(soup, source: str = "") -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_photos(soup, source: str = "") -> bool:
-    """
-    Multi-strategy photo detection. Returns True if business photos exist.
-    """
     source_lower = source.lower()
 
-    # ── Strategy 0 (NEW): JSON-LD image array ────────────────────────────
     ld_blocks = _extract_json_ld(soup)
     ld = _ld_find(ld_blocks, "LocalBusiness", "Organization", "Store", "Restaurant")
     if ld:
@@ -363,7 +331,6 @@ def _detect_photos(soup, source: str = "") -> bool:
         if isinstance(images, list) and len(images) > 0:
             return True
 
-    # ── Strategy 1: gallery / photo section containers ────────────────────
     for container in soup.find_all(["div", "section", "ul", "figure"]):
         cls = _cls_str(container)
         if _PHOTO_CLASS_PATTERNS.search(cls):
@@ -376,13 +343,11 @@ def _detect_photos(soup, source: str = "") -> bool:
             if "background" in style.lower() and "url(" in style.lower():
                 return True
 
-    # ── Strategy 2: CSS background-image on any element ───────────────────
     bg_urls = _css_background_images(soup)
     for url in bg_urls:
         if not _is_ui_image(url):
             return True
 
-    # ── Strategy 3: hero / banner container ───────────────────────────────
     hero_signals = re.compile(
         r"(hero|banner|cover|carousel|slider|slideshow|"
         r"featured|backdrop|jumbotron|masthead)",
@@ -396,14 +361,12 @@ def _detect_photos(soup, source: str = "") -> bool:
                 if srcs and not _is_tiny(img, 40) and not _is_ui_image(srcs[0]):
                     return True
 
-    # ── Strategy 4: photo src patterns ───────────────────────────────────
     for img in soup.find_all("img"):
         for src in _all_srcs(img):
             if _PHOTO_SRC_PATTERNS.search(src) and not _is_ui_image(src):
                 if not _is_tiny(img, 40):
                     return True
 
-    # ── Strategy 5: Photos tab / link ────────────────────────────────────
     for a in soup.find_all("a"):
         txt = a.get_text(strip=True).lower()
         href = a.get("href", "").lower()
@@ -411,7 +374,6 @@ def _detect_photos(soup, source: str = "") -> bool:
             if not any(d in href for d in ("google", "facebook", "twitter", "instagram")):
                 return True
 
-    # ── Strategy 6: og:image ──────────────────────────────────────────────
     og = (soup.find("meta", property="og:image") or
           soup.find("meta", attrs={"name": "og:image"}))
     if og and og.get("content", "").startswith("http"):
@@ -419,7 +381,6 @@ def _detect_photos(soup, source: str = "") -> bool:
         if not _is_ui_image(og_url):
             return True
 
-    # ── Strategy 7: any two sufficiently large, non-UI <img> tags ─────────
     large_img_count = 0
     for img in soup.find_all("img"):
         srcs = _all_srcs(img)
@@ -455,11 +416,28 @@ _BAD_DESC_PHRASES = (
 )
 
 
-def _good_desc(text: str, min_len: int = 40) -> bool:
+def _good_desc(text: str, min_len: int = 60) -> bool:
+    """
+    FIX v4: min_len raised from 40→60 to filter address-only strings.
+    Also rejects text that looks like a bare address / phone dump.
+    """
     if len(text) < min_len:
         return False
     tl = text.lower()
-    return not any(b in tl for b in _BAD_DESC_PHRASES)
+    if any(b in tl for b in _BAD_DESC_PHRASES):
+        return False
+    # Reject text that is overwhelmingly address/phone data
+    if _ADDRESS_LIKE.match(text):
+        return False
+    # Reject if more than half the tokens look like an address line
+    addr_tokens = re.findall(
+        r"\b(\d{3,}|blvd|street|avenue|suite|ste|fl\b|zip|phone|tel)\b",
+        tl,
+    )
+    word_count = len(text.split())
+    if word_count > 0 and len(addr_tokens) / word_count > 0.35:
+        return False
+    return True
 
 
 def _longest_good_para(soup) -> str:
@@ -475,16 +453,66 @@ def _longest_good_para(soup) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Per-domain extractors — description, website, hours, social
+#  Shared category helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Common "skip" domains for website URL extraction
+def _extract_category_generic(soup) -> str:
+    """
+    Try several generic strategies to extract the business category:
+      1. itemprop="category"
+      2. JSON-LD additionalType / knowsAbout
+      3. Breadcrumb last item (often the category)
+      4. <meta name="keywords"> first token
+    """
+    # Strategy 1: microdata
+    cat = _itemprop(soup, "category")
+    if cat and len(cat) < 80:
+        return cat
+
+    # Strategy 2: JSON-LD
+    ld_blocks = _extract_json_ld(soup)
+    for ld in ld_blocks:
+        for key in ("additionalType", "knowsAbout", "serviceType", "category"):
+            val = ld.get(key, "")
+            if isinstance(val, list):
+                val = val[0] if val else ""
+            if isinstance(val, str) and val and len(val) < 80:
+                # Strip schema.org URLs
+                val = val.split("/")[-1].replace("-", " ").replace("_", " ")
+                return val
+
+    # Strategy 3: breadcrumb — last crumb before current page title
+    for nav in soup.find_all(["nav", "ol", "ul", "div"],
+                              class_=re.compile(r"breadcrumb", re.I)):
+        items = nav.find_all(["li", "a", "span"])
+        texts = [i.get_text(strip=True) for i in items if i.get_text(strip=True)]
+        if len(texts) >= 2:
+            # Second-to-last is usually the category
+            candidate = texts[-2]
+            if 3 < len(candidate) < 60:
+                return candidate
+
+    # Strategy 4: meta keywords first token
+    meta_kw = soup.find("meta", attrs={"name": "keywords"})
+    if meta_kw:
+        kw = meta_kw.get("content", "").split(",")[0].strip()
+        if kw and len(kw) < 60:
+            return kw
+
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Common skip domains
+# ─────────────────────────────────────────────────────────────────────────────
+
+# FIX v4: Added nearfinder.com (catches blog.nearfinder.com) and cloudflare.com
 _SKIP_DOMAINS = (
-    "enrollbusiness.com", "nearfinderus.com", "hotfrog.com",
-    "brownbook.net", "freelistingusa.com", "smallbusinessusa.com",
-    "askmap.net", "google.com", "facebook.com", "instagram.com",
-    "twitter.com", "linkedin.com", "whatsapp.com", "youtube.com",
-    "yelp.com",
+    "enrollbusiness.com", "nearfinderus.com", "nearfinder.com",
+    "hotfrog.com", "brownbook.net", "freelistingusa.com",
+    "smallbusinessusa.com", "askmap.net", "google.com",
+    "facebook.com", "instagram.com", "twitter.com", "linkedin.com",
+    "whatsapp.com", "youtube.com", "yelp.com", "cloudflare.com",
 )
 
 _SOCIAL_DOMAINS = (
@@ -495,7 +523,6 @@ _SOCIAL_DOMAINS = (
 
 
 def _first_external_link(soup) -> str:
-    """Return the first <a href> that is not in _SKIP_DOMAINS."""
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith("http") and not any(s in href for s in _SKIP_DOMAINS):
@@ -512,26 +539,62 @@ def _social_links_generic(soup) -> str:
     return ", ".join(dict.fromkeys(links))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Per-domain extractors
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── askmap.net ───────────────────────────────────────────────────────────────
 
 def _extract_askmap(soup) -> dict:
     """
-    askmap uses schema.org microdata throughout.
-    Almost everything is in itemprop attributes.
+    FIX v4:
+    - itemprop="description" is often just the address on askmap; validate
+      with _good_desc before using it.
+    - Fall back to the Info <div>/<p> block which holds the real description.
+    - Category extracted via _extract_category_generic.
     """
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": ""}
+           "social_links": "", "gbp_link": "", "category": ""}
 
-    # Description
+    # ── Description ──
+    # Priority 1: itemprop="description" — but only if it's a real description
     desc = _itemprop(soup, "description")
     if _good_desc(desc):
         out["description_text"] = desc
-    else:
+
+    # Priority 2: div/section with class "info", "about", "description"
+    if not out["description_text"]:
+        for tag in soup.find_all(["div", "section", "p"]):
+            cls = _cls_str(tag)
+            if re.search(r"\b(info|about|description|overview|summary)\b", cls):
+                if _is_hidden_tag(tag):
+                    continue
+                text = tag.get_text(separator=" ", strip=True)
+                if _good_desc(text):
+                    out["description_text"] = text
+                    break
+
+    # Priority 3: heading "Info" / "About" → next sibling
+    if not out["description_text"]:
+        for h in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
+            htxt = h.get_text(strip=True).lower()
+            if htxt in ("info", "about", "description", "about us", "overview"):
+                for sib in h.find_next_siblings(["p", "div"]):
+                    text = sib.get_text(separator=" ", strip=True)
+                    if _good_desc(text):
+                        out["description_text"] = text
+                        break
+                if out["description_text"]:
+                    break
+
+    # Priority 4: longest good paragraph
+    if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # Website: itemprop="url" first, then rel="nofollow" external links,
-    # then generic fallback. askmap wraps the external website in a link
-    # with rel="nofollow external" or class containing "website".
+    # ── Category ──
+    out["category"] = _extract_category_generic(soup)
+
+    # ── Website ──
     url_tag = soup.find(itemprop="url")
     if url_tag:
         href = url_tag.get("href", "") or url_tag.get("content", "")
@@ -548,7 +611,7 @@ def _extract_askmap(soup) -> dict:
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # Hours: itemprop="openingHours" or itemprop="openingHoursSpecification"
+    # ── Hours ──
     hours_tags = soup.find_all(itemprop="openingHours")
     if hours_tags:
         out["hours"] = "; ".join(t.get_text(strip=True) for t in hours_tags
@@ -559,7 +622,7 @@ def _extract_askmap(soup) -> dict:
             out["hours"] = "; ".join(t.get_text(separator=" ", strip=True)
                                       for t in spec_tags if t.get_text(strip=True))
 
-    # Social + GBP
+    # ── Social + GBP ──
     out["social_links"] = _social_links_generic(soup)
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
@@ -573,20 +636,13 @@ def _extract_askmap(soup) -> dict:
 # ── brownbook.net ─────────────────────────────────────────────────────────────
 
 def _extract_brownbook(soup) -> dict:
-    """
-    brownbook uses schema.org microdata AND sometimes JSON-LD.
-    Itemprop attributes are the most reliable extraction path.
-    """
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": ""}
+           "social_links": "", "gbp_link": "", "category": ""}
 
-    # ── Description ──
-    # Priority 1: itemprop="description"
     desc = _itemprop(soup, "description")
     if _good_desc(desc):
         out["description_text"] = desc
     else:
-        # Priority 2: div/p with class containing "description" or "about"
         for tag in soup.find_all(["div", "p", "section"]):
             cls = _cls_str(tag)
             if re.search(r"(description|about|overview|summary)", cls):
@@ -597,15 +653,13 @@ def _extract_brownbook(soup) -> dict:
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # ── Website URL ──
-    # Priority 1: itemprop="url"
+    out["category"] = _extract_category_generic(soup)
+
     url_tag = soup.find(itemprop="url")
     if url_tag:
         href = url_tag.get("href", "") or url_tag.get("content", "")
         if href.startswith("http") and not any(s in href for s in _SKIP_DOMAINS):
             out["website_url"] = href
-
-    # Priority 2: <a class="website"> or text "Visit Website"
     if not out["website_url"]:
         website_label = re.compile(r"(visit website|website|web site|official site)", re.I)
         for a in soup.find_all("a", href=True):
@@ -616,13 +670,9 @@ def _extract_brownbook(soup) -> dict:
                 if not any(s in href for s in _SKIP_DOMAINS):
                     out["website_url"] = href
                     break
-
-    # Priority 3: any outbound link
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # ── Hours ──
-    # openingHours microdata or a div/section labeled "Opening Hours"
     hours_tags = soup.find_all(itemprop="openingHours")
     if hours_tags:
         out["hours"] = "; ".join(t.get("content", t.get_text(strip=True))
@@ -636,7 +686,6 @@ def _extract_brownbook(soup) -> dict:
                     out["hours"] = text
                     break
 
-    # ── Social + GBP ──
     out["social_links"] = _social_links_generic(soup)
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
@@ -650,14 +699,9 @@ def _extract_brownbook(soup) -> dict:
 # ── freelistingusa.com ───────────────────────────────────────────────────────
 
 def _extract_freelistingusa(soup) -> dict:
-    """
-    freelistingusa uses a mix of custom CSS classes and schema.org microdata.
-    """
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": ""}
+           "social_links": "", "gbp_link": "", "category": ""}
 
-    # ── Description ──
-    # Priority 1: div.listing-description, div.description, p.description
     for tag in soup.find_all(["div", "p", "section"]):
         cls = _cls_str(tag)
         if re.search(r"(listing[-_]?description|business[-_]?description|"
@@ -666,12 +710,10 @@ def _extract_freelistingusa(soup) -> dict:
             if _good_desc(text):
                 out["description_text"] = text
                 break
-    # Priority 2: itemprop="description"
     if not out["description_text"]:
         desc = _itemprop(soup, "description")
         if _good_desc(desc):
             out["description_text"] = desc
-    # Priority 3: heading "About" or "Description" → next sibling
     if not out["description_text"]:
         for h in soup.find_all(["h2", "h3", "h4", "strong"]):
             htxt = h.get_text(strip=True).lower()
@@ -686,8 +728,8 @@ def _extract_freelistingusa(soup) -> dict:
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # ── Website URL ──
-    # Priority 1: div.website a, or a[class*=website], or itemprop="url"
+    out["category"] = _extract_category_generic(soup)
+
     for tag in soup.find_all(["div", "p", "li", "span"]):
         cls = _cls_str(tag)
         if re.search(r"(website|web[-_]?site|official[-_]?site)", cls):
@@ -706,7 +748,6 @@ def _extract_freelistingusa(soup) -> dict:
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # ── Hours ──
     for tag in soup.find_all(["div", "section", "table", "ul"]):
         cls = _cls_str(tag)
         if re.search(r"(hours|working[-_]?hours|open[-_]?hours|schedule)", cls):
@@ -719,7 +760,6 @@ def _extract_freelistingusa(soup) -> dict:
         if hours_tags:
             out["hours"] = "; ".join(h for h in hours_tags if h)
 
-    # ── Social + GBP ──
     out["social_links"] = _social_links_generic(soup)
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
@@ -733,12 +773,8 @@ def _extract_freelistingusa(soup) -> dict:
 # ── hotfrog.com ───────────────────────────────────────────────────────────────
 
 def _extract_hotfrog(soup) -> dict:
-    """
-    Hotfrog is a React SPA. All key data is in JSON-LD
-    (<script type="application/ld+json">). DOM is a fallback.
-    """
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": ""}
+           "social_links": "", "gbp_link": "", "category": ""}
 
     ld_blocks = _extract_json_ld(soup)
     ld = _ld_find(ld_blocks, "LocalBusiness", "Organization", "Store",
@@ -746,24 +782,20 @@ def _extract_hotfrog(soup) -> dict:
                   "LegalService", "HomeAndConstructionBusiness")
 
     if ld:
-        # Description
         desc = ld.get("description", "")
         if _good_desc(desc):
             out["description_text"] = desc
 
-        # Website
         url = ld.get("url", "")
         if url and not any(s in url for s in _SKIP_DOMAINS):
             out["website_url"] = url
 
-        # Hours: openingHours is a list of strings like "Mo-Fr 09:00-17:00"
         hours_val = ld.get("openingHours", [])
         if isinstance(hours_val, list):
             out["hours"] = "; ".join(hours_val)
         elif isinstance(hours_val, str):
             out["hours"] = hours_val
 
-        # openingHoursSpecification (more detailed)
         if not out["hours"]:
             specs = ld.get("openingHoursSpecification", [])
             if isinstance(specs, list):
@@ -778,7 +810,15 @@ def _extract_hotfrog(soup) -> dict:
                         parts.append(f"{days}: {opens}–{closes}".strip())
                 out["hours"] = "; ".join(parts)
 
-    # Fallback description from DOM if JSON-LD was empty / bad
+        # Category from JSON-LD
+        for key in ("additionalType", "knowsAbout", "serviceType"):
+            val = ld.get(key, "")
+            if isinstance(val, list):
+                val = val[0] if val else ""
+            if isinstance(val, str) and val:
+                out["category"] = val.split("/")[-1].replace("-", " ")
+                break
+
     if not out["description_text"]:
         for tag in soup.find_all(["div", "p", "section"]):
             cls = _cls_str(tag)
@@ -790,7 +830,9 @@ def _extract_hotfrog(soup) -> dict:
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # Fallback website from DOM
+    if not out["category"]:
+        out["category"] = _extract_category_generic(soup)
+
     if not out["website_url"]:
         label_re = re.compile(r"(visit website|website|web site|official site)", re.I)
         for a in soup.find_all("a", href=True):
@@ -803,9 +845,7 @@ def _extract_hotfrog(soup) -> dict:
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # Social (hotfrog sometimes has social icons in DOM even when JSON-LD is used)
     soc = _social_links_generic(soup)
-    # Also check JSON-LD sameAs
     same_as = ld.get("sameAs", []) if ld else []
     if isinstance(same_as, str):
         same_as = [same_as]
@@ -814,7 +854,6 @@ def _extract_hotfrog(soup) -> dict:
             soc = (soc + ", " + url).strip(", ")
     out["social_links"] = soc
 
-    # GBP
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
                 p in a["href"] for p in ("maps/place", "maps?q", "goo.gl")):
@@ -827,14 +866,9 @@ def _extract_hotfrog(soup) -> dict:
 # ── smallbusinessusa.com ──────────────────────────────────────────────────────
 
 def _extract_smallbusinessusa(soup) -> dict:
-    """
-    smallbusinessusa uses recognisable CSS class names; no schema.org.
-    """
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": ""}
+           "social_links": "", "gbp_link": "", "category": ""}
 
-    # ── Description ──
-    # Priority 1: div.business-description, div.about, div.company-description
     for tag in soup.find_all(["div", "p", "section", "article"]):
         cls = _cls_str(tag)
         if re.search(r"(business[-_]?description|company[-_]?description|"
@@ -844,7 +878,6 @@ def _extract_smallbusinessusa(soup) -> dict:
             if _good_desc(text):
                 out["description_text"] = text
                 break
-    # Priority 2: heading "About" → next sibling
     if not out["description_text"]:
         for h in soup.find_all(["h2", "h3", "h4", "strong"]):
             htxt = h.get_text(strip=True).lower()
@@ -859,8 +892,8 @@ def _extract_smallbusinessusa(soup) -> dict:
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # ── Website URL ──
-    # Priority 1: div/li with class containing "website"
+    out["category"] = _extract_category_generic(soup)
+
     for tag in soup.find_all(["div", "li", "p", "span"]):
         cls = _cls_str(tag)
         if "website" in cls:
@@ -870,7 +903,6 @@ def _extract_smallbusinessusa(soup) -> dict:
                 if href.startswith("http") and not any(s in href for s in _SKIP_DOMAINS):
                     out["website_url"] = href
                     break
-    # Priority 2: button/a labeled "Visit Website"
     if not out["website_url"]:
         label_re = re.compile(r"(visit website|website|official site|web site)", re.I)
         for a in soup.find_all("a", href=True):
@@ -883,7 +915,6 @@ def _extract_smallbusinessusa(soup) -> dict:
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # ── Hours ──
     for tag in soup.find_all(["div", "section", "table", "ul"]):
         cls = _cls_str(tag)
         if re.search(r"(hours|working[-_]?hours|business[-_]?hours|schedule|open)", cls):
@@ -892,7 +923,6 @@ def _extract_smallbusinessusa(soup) -> dict:
                 out["hours"] = text
                 break
 
-    # ── Social + GBP ──
     out["social_links"] = _social_links_generic(soup)
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
@@ -903,48 +933,106 @@ def _extract_smallbusinessusa(soup) -> dict:
     return out
 
 
-# ── nearfinderus.com  (already existed — kept + improved) ────────────────────
+# ── nearfinderus.com ─────────────────────────────────────────────────────────
 
 def _extract_nearfinderus(soup) -> dict:
+    """
+    FIX v4:
+    - Redirect wrapper broadened: match any /redirect?url= pattern (not just /empresa/)
+    - nearfinder.com added to _SKIP_DOMAINS so blog.nearfinder.com is filtered
+    - Description: "More about" heading search expanded; sibling search now
+      also looks at div children; falls back to _longest_good_para
+    - Category: extracted from breadcrumb / itemprop
+    - Hours: extracted directly from the opening-hours table/list rows
+    """
     from urllib.parse import unquote
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": ""}
+           "social_links": "", "gbp_link": "", "category": ""}
 
-    # Description: P1 div.mt-4 > visible p
-    for div in soup.find_all("div"):
-        if "mt-4" in " ".join(div.get("class", [])):
-            for p in div.find_all("p"):
-                if not _is_hidden_tag(p):
+    # ── Description ──
+    # Priority 1: "More about …" section
+    for h in soup.find_all(["h2", "h3", "h4", "strong", "b", "p"]):
+        htxt = h.get_text(strip=True).lower()
+        if re.search(r"more about|about\s+\w", htxt):
+            # Check next siblings
+            for sib in h.find_next_siblings(["p", "div", "section"]):
+                if _is_hidden_tag(sib):
+                    continue
+                text = sib.get_text(separator=" ", strip=True)
+                if _good_desc(text):
+                    out["description_text"] = text
+                    break
+            # Also check direct children of parent
+            if not out["description_text"] and h.parent:
+                for child in h.parent.find_all(["p", "div"], recursive=False):
+                    if child == h:
+                        continue
+                    if _is_hidden_tag(child):
+                        continue
+                    text = child.get_text(separator=" ", strip=True)
+                    if _good_desc(text):
+                        out["description_text"] = text
+                        break
+            if out["description_text"]:
+                break
+
+    # Priority 2: div with mt-4 class containing a real description paragraph
+    if not out["description_text"]:
+        for div in soup.find_all("div"):
+            classes = " ".join(div.get("class", []))
+            if "mt-4" in classes:
+                for p in div.find_all("p"):
+                    if _is_hidden_tag(p):
+                        continue
                     text = p.get_text(separator=" ", strip=True)
                     if _good_desc(text):
                         out["description_text"] = text
                         break
-        if out["description_text"]:
-            break
-    # P2: heading "More about" → next sibling
+            if out["description_text"]:
+                break
+
+    # Priority 3: any section/div labeled description / about / info
     if not out["description_text"]:
-        for h in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
-            if "more about" in h.get_text().lower():
-                for sib in h.find_next_siblings(["p", "div"]):
-                    text = sib.get_text(separator=" ", strip=True)
-                    if _good_desc(text):
-                        out["description_text"] = text
-                        break
-                if out["description_text"]:
+        for tag in soup.find_all(["div", "section", "article"]):
+            cls = _cls_str(tag)
+            if re.search(r"\b(description|about|overview|info)\b", cls):
+                if _is_hidden_tag(tag):
+                    continue
+                text = tag.get_text(separator=" ", strip=True)
+                if _good_desc(text):
+                    out["description_text"] = text
                     break
+
+    # Priority 4: longest good paragraph
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # Website + social via redirect wrapper
+    # ── Category ──
+    out["category"] = _extract_category_generic(soup)
+    # nearfinderus breadcrumb has the category as second-to-last link
+    if not out["category"]:
+        breadcrumb_links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "category_" in href or "/category/" in href:
+                txt = a.get_text(strip=True)
+                if txt:
+                    breadcrumb_links.append(txt)
+        if breadcrumb_links:
+            out["category"] = breadcrumb_links[-1]
+
+    # ── Website + Social via redirect wrapper ──
+    # FIX v4: broadened regex to catch /redirect?url= anywhere in path
     social_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/empresa/redirect?url=" in href:
-            raw = href.split("url=")[1].split("&")[0]
-            decoded = unquote(raw)
+        # Match any redirect wrapper pattern: /redirect?url=, /empresa/redirect?url=, etc.
+        redirect_match = re.search(r"/redirect\?url=([^&\s]+)", href)
+        if redirect_match:
+            decoded = unquote(redirect_match.group(1))
             if any(s in decoded for s in _SOCIAL_DOMAINS):
                 social_links.append(decoded)
-            elif not any(s in decoded for s in ("whatsapp.com", "nearfinderus.com")):
+            elif not any(s in decoded for s in _SKIP_DOMAINS):
                 if not out["website_url"]:
                     out["website_url"] = decoded
         elif href.startswith("http") and not out["website_url"]:
@@ -952,16 +1040,44 @@ def _extract_nearfinderus(soup) -> dict:
                 out["website_url"] = href
     out["social_links"] = ", ".join(dict.fromkeys(social_links))
 
-    # Hours
-    for tag in soup.find_all(["div", "section", "table"]):
-        cls = _cls_str(tag)
-        if re.search(r"(hours|schedule|working|opening)", cls):
+    # ── Hours ──
+    # FIX v4: extract directly from the opening-hours table rows
+    # nearfinderus renders a table/list with day + time columns
+    hours_rows = []
+    for container in soup.find_all(["div", "section", "table", "ul"]):
+        cls = _cls_str(container)
+        if re.search(r"(hours|schedule|working|opening|open)", cls):
+            # Table-based hours
+            rows = container.find_all("tr")
+            if rows:
+                for row in rows:
+                    cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                    if len(cells) >= 2:
+                        hours_rows.append(": ".join(cells[:2]))
+            if not hours_rows:
+                # List / div-row based
+                text = container.get_text(separator="|", strip=True)
+                if text and len(text) < 600:
+                    out["hours"] = text
+            if hours_rows:
+                out["hours"] = "; ".join(hours_rows)
+            if out["hours"]:
+                break
+
+    # Fallback: look for day-name patterns in any visible text block
+    if not out["hours"]:
+        day_pattern = re.compile(
+            r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+            r"mon|tue|wed|thu|fri|sat|sun)",
+            re.IGNORECASE,
+        )
+        for tag in soup.find_all(["p", "div", "li", "span"]):
             text = tag.get_text(separator=" ", strip=True)
-            if text and len(text) < 400:
+            if day_pattern.search(text) and len(text) < 300 and not _is_hidden_tag(tag):
                 out["hours"] = text
                 break
 
-    # GBP
+    # ── GBP ──
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
                 p in a["href"] for p in ("maps/place", "maps?q", "goo.gl")):
@@ -971,13 +1087,17 @@ def _extract_nearfinderus(soup) -> dict:
     return out
 
 
-# ── us.enrollbusiness.com (already existed — kept + improved) ────────────────
+# ── us.enrollbusiness.com ─────────────────────────────────────────────────────
 
 def _extract_enrollbusiness(soup) -> dict:
+    """
+    FIX v4:
+    - Category extracted via _extract_category_generic.
+    - Hours: "Working Hours:" label used as anchor.
+    """
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": ""}
+           "social_links": "", "gbp_link": "", "category": ""}
 
-    # Description P1: section/div labeled About/Description
     for tag in soup.find_all(["div", "section", "article"]):
         cls = _cls_str(tag)
         if re.search(r"(about|description|overview|summary|info[-_]?text)", cls):
@@ -985,7 +1105,6 @@ def _extract_enrollbusiness(soup) -> dict:
             if _good_desc(text):
                 out["description_text"] = text
                 break
-    # P2: heading → next sibling
     if not out["description_text"]:
         for h in soup.find_all(["h1","h2","h3","h4","h5","strong"]):
             htxt = h.get_text(strip=True).lower()
@@ -1000,7 +1119,8 @@ def _extract_enrollbusiness(soup) -> dict:
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
 
-    # Website: "Visit Website" label or any outbound link
+    out["category"] = _extract_category_generic(soup)
+
     website_labels = re.compile(r"(visit website|website|web site|official site|homepage)", re.I)
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -1012,16 +1132,29 @@ def _extract_enrollbusiness(soup) -> dict:
     if not out["website_url"]:
         out["website_url"] = _first_external_link(soup)
 
-    # Hours: look for a section/div labeled Hours
-    for tag in soup.find_all(["div", "section", "table"]):
+    # FIX v4: anchor on "Working Hours:" label
+    for tag in soup.find_all(["div", "section", "table", "li"]):
         cls = _cls_str(tag)
-        if re.search(r"(hours|working[-_]?hours|business[-_]?hours|schedule)", cls):
-            text = tag.get_text(separator=" ", strip=True)
-            if text and len(text) < 400:
-                out["hours"] = text
-                break
+        text = tag.get_text(separator=" ", strip=True)
+        if re.search(r"(working hours|business hours|hours of operation|opening hours)", text, re.I):
+            if len(text) < 500:
+                # Strip the label prefix and keep the hours portion
+                hours_text = re.sub(
+                    r"^.*(working hours|business hours|hours of operation|opening hours)\s*[:\-]?\s*",
+                    "", text, flags=re.IGNORECASE,
+                ).strip()
+                if hours_text:
+                    out["hours"] = hours_text
+                    break
+    if not out["hours"]:
+        for tag in soup.find_all(["div", "section", "table"]):
+            cls = _cls_str(tag)
+            if re.search(r"(hours|working[-_]?hours|business[-_]?hours|schedule)", cls):
+                text = tag.get_text(separator=" ", strip=True)
+                if text and len(text) < 400:
+                    out["hours"] = text
+                    break
 
-    # Social + GBP
     out["social_links"] = _social_links_generic(soup)
     for a in soup.find_all("a", href=True):
         if "google.com" in a["href"] and any(
@@ -1037,7 +1170,6 @@ def _extract_enrollbusiness(soup) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _route_domain(source_lower: str):
-    """Return the correct per-domain extractor function, or None for generic."""
     if "askmap" in source_lower:
         return _extract_askmap
     if "brownbook" in source_lower:
@@ -1056,20 +1188,29 @@ def _route_domain(source_lower: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Cloudflare challenge detector
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CF_CHALLENGE_SIGNALS = (
+    "cloudflare.com?utm_source=challenge",
+    "cf_chl_",
+    "cdn-cgi/challenge-platform",
+    "Just a moment",
+    "checking your browser",
+    "DDoS protection by Cloudflare",
+)
+
+
+def _is_cloudflare_challenge(html: str, text: str) -> bool:
+    combined = (html[:5000] + text[:2000]).lower()
+    return any(s.lower() in combined for s in _CF_CHALLENGE_SIGNALS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Main pre-extraction function
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dict:
-    """
-    Structurally extract all fields from page HTML using BeautifulSoup.
-    Returns a hints dict with confirmed values passed to the AI as authoritative.
-
-    New in v3:
-      - hours field added
-      - per-domain extractor routing for all 7 domains
-      - JSON-LD extraction layer (hotfrog, brownbook, freelistingusa)
-      - schema.org microdata extraction (askmap, brownbook)
-    """
     hints = {
         "logo_html":        "",
         "logo_confirmed":   False,
@@ -1078,9 +1219,17 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
         "website_url":      "",
         "social_links":     "",
         "gbp_link":         "",
-        "hours":            "",         # NEW in v3
+        "hours":            "",
+        "category":         "",
+        # FIX v4: flag when Cloudflare challenge page detected
+        "cloudflare_blocked": False,
     }
     if not page_html:
+        return hints
+
+    # FIX v4: detect Cloudflare challenge early — no point extracting
+    if _is_cloudflare_challenge(page_html, page_text):
+        hints["cloudflare_blocked"] = True
         return hints
 
     try:
@@ -1088,27 +1237,21 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
         soup = BeautifulSoup(page_html, "html.parser")
         source_lower = source.lower()
 
-        # ── LOGO ─────────────────────────────────────────────────────────
-        logo_html = _detect_logo(soup, source)
-        if logo_html:
-            hints["logo_html"]      = logo_html
-            hints["logo_confirmed"] = True
-
-        # ── PHOTOS ───────────────────────────────────────────────────────
+        hints["logo_confirmed"]   = bool(_detect_logo(soup, source))
+        hints["logo_html"]        = _detect_logo(soup, source) if hints["logo_confirmed"] else ""
         hints["photos_confirmed"] = _detect_photos(soup, source)
 
-        # ── TEXT FIELDS via per-domain router ─────────────────────────────
         extractor = _route_domain(source_lower)
         if extractor:
             domain_out = extractor(soup)
         else:
-            # Generic fallback for unknown domains
             domain_out = {
                 "description_text": _longest_good_para(soup),
                 "website_url":      _first_external_link(soup),
                 "hours":            "",
                 "social_links":     _social_links_generic(soup),
                 "gbp_link":         "",
+                "category":         _extract_category_generic(soup),
             }
 
         hints["description_text"] = domain_out.get("description_text", "")
@@ -1116,6 +1259,7 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
         hints["hours"]            = domain_out.get("hours", "")
         hints["social_links"]     = domain_out.get("social_links", "")
         hints["gbp_link"]         = domain_out.get("gbp_link", "")
+        hints["category"]         = domain_out.get("category", "")
 
     except Exception:
         pass
@@ -1128,12 +1272,16 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_prompt(page_text: str, page_html: str, fields: list, source: str = "") -> str:
-    """
-    Build a generic extraction prompt.
-    HTML is always included so the model can detect images for visual fields.
-    Pre-extracted hints are passed as AUTHORITATIVE confirmed values.
-    """
     hints = _extract_page_hints(page_html, page_text, source)
+
+    # FIX v4: if Cloudflare blocked, tell Gemini so it doesn't hallucinate
+    if hints.get("cloudflare_blocked"):
+        return (
+            f'You are a business data extraction assistant.\n'
+            f'This page returned a Cloudflare security challenge and contains NO real business data.\n'
+            f'Return ONLY a JSON object with null for every field: {fields}\n'
+            f'Example: {{{", ".join(repr(f)+": null" for f in fields)}}}'
+        )
 
     all_img_tags = re.findall(r'<img[^>]*>', page_html, flags=re.IGNORECASE)
     img_section  = "\n".join(all_img_tags[:100]) if all_img_tags else ""
@@ -1149,7 +1297,6 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
     else:
         html_snippet = page_html
 
-    # ── Build pre-extracted facts section ────────────────────────────────
     pre_extracted_facts = []
 
     if hints["logo_confirmed"]:
@@ -1184,6 +1331,11 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
         pre_extracted_facts.append(
             f'GBP LINK (confirmed from page HTML):\n{hints["gbp_link"]}'
         )
+    # FIX v4: pass pre-extracted category to AI
+    if hints["category"]:
+        pre_extracted_facts.append(
+            f'CATEGORY (confirmed from page HTML — use as-is):\n{hints["category"]}'
+        )
 
     parts = []
     if pre_extracted_facts:
@@ -1204,7 +1356,6 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
 
     content_section = "\n\n".join(parts)
 
-    # ── Field rules ───────────────────────────────────────────────────────
     field_rules = []
     for f in fields:
         if f == "Name":
@@ -1218,7 +1369,8 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
             field_rules.append(
                 '- "Website URL": the business\'s own website URL.\n'
                 '  If WEBSITE URL appears in PRE-EXTRACTED FIELDS above, use it directly.\n'
-                '  Otherwise find a "Visit Website" or external link — NOT the directory domain.'
+                '  Otherwise find a "Visit Website" or external link — NOT the directory domain.\n'
+                '  NEVER return a cloudflare.com URL.'
             )
         elif f == "Street":
             field_rules.append('- "Street": street address (number + street name).')
@@ -1234,7 +1386,10 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
                 'A two-letter ISO code is a valid answer.'
             )
         elif f == "Category":
-            field_rules.append('- "Category": business type / industry category shown.')
+            field_rules.append(
+                '- "Category": business type / industry category shown.\n'
+                '  If CATEGORY appears in PRE-EXTRACTED FIELDS above, use it directly.'
+            )
         elif f == "Keywords":
             field_rules.append(
                 '- "Keywords": tags, keywords, or labels for the business. '
@@ -1246,7 +1401,7 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
                 '  If DESCRIPTION TEXT appears in PRE-EXTRACTED FIELDS above, use it verbatim.\n'
                 '  Otherwise find prose paragraphs describing what the business does.\n'
                 '  EXCLUDE: navigation text, review prompts, "Payment methods", '
-                '"Last update", footer text.\n'
+                '"Last update", footer text, bare address strings, phone numbers.\n'
                 '  Return null only if no genuine description exists.'
             )
         elif f == "Hours":
@@ -1303,6 +1458,8 @@ CRITICAL RULES:
 - Use null for fields genuinely absent from the page.
 - Do NOT guess or invent values.
 - For Logo and Photos: if PRE-EXTRACTED FIELDS confirms PRESENT, return "PRESENT" — do not second-guess.
+- For Website URL: NEVER return a cloudflare.com URL — return null if only cloudflare URLs exist.
+- For Description: NEVER return a bare address string or phone number as the description.
 
 FIELD INSTRUCTIONS:
 {rules_text}
@@ -1399,20 +1556,30 @@ def extract_fields(
             extracted["_truncated"] = True
         extracted["_model"] = model_used
 
-        # ── POST-PROCESS: authoritative overrides from pre-extraction ─────
-        # These survive AI hallucination and context-window truncation.
+        # ── POST-PROCESS: authoritative overrides ─────────────────────────
         hints = _extract_page_hints(page_html, page_text, source)
+
+        # FIX v4: if Cloudflare challenge, null all fields
+        if hints.get("cloudflare_blocked"):
+            for f in fields:
+                extracted[f] = None
+            extracted["_cloudflare_blocked"] = True
+            extracted["_model"] = model_used
+            return extracted
 
         if hints["logo_confirmed"] and "Logo" in fields:
             extracted["Logo"] = "PRESENT"
         if hints["photos_confirmed"] and "Photos" in fields:
             extracted["Photos"] = "PRESENT"
+
         # Only override text fields if AI returned null/empty AND we have a value
         if hints["description_text"] and "Description" in fields:
             if not extracted.get("Description"):
                 extracted["Description"] = hints["description_text"]
         if hints["website_url"] and "Website URL" in fields:
-            if not extracted.get("Website URL"):
+            ai_url = extracted.get("Website URL", "") or ""
+            # FIX v4: also clear Cloudflare URLs that Gemini may have returned
+            if not ai_url or "cloudflare.com" in ai_url:
                 extracted["Website URL"] = hints["website_url"]
         if hints["hours"] and "Hours" in fields:
             if not extracted.get("Hours"):
@@ -1423,6 +1590,16 @@ def extract_fields(
         if hints["gbp_link"] and "GBP Link" in fields:
             if not extracted.get("GBP Link"):
                 extracted["GBP Link"] = hints["gbp_link"]
+        # FIX v4: category override
+        if hints["category"] and "Category" in fields:
+            if not extracted.get("Category"):
+                extracted["Category"] = hints["category"]
+
+        # FIX v4: final Cloudflare URL guard regardless of source
+        if "Website URL" in fields:
+            url_val = extracted.get("Website URL", "") or ""
+            if "cloudflare.com" in url_val:
+                extracted["Website URL"] = None
 
     except json.JSONDecodeError as e:
         extracted = {"_parse_error": str(e), "_raw": raw[:800], "_model": model_used}
