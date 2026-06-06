@@ -1742,9 +1742,12 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
             field_rules.append(
                 '- "Keywords": business-type tags and service keywords ONLY.\n'
                 '  If KEYWORDS appears in PRE-EXTRACTED FIELDS above, use it directly.\n'
-                '  If NO KEYWORDS hint is present in PRE-EXTRACTED FIELDS, return null.\n'
-                '  DO NOT infer or guess keywords from the page text — only use explicit\n'
-                '  meta-keyword data. If unsure, return null.\n'
+                '  If NO KEYWORDS hint is present in PRE-EXTRACTED FIELDS, you MUST\n'
+                '  return null — this means the page has no meta keywords tag.\n'
+                '  ABSOLUTELY DO NOT infer, guess, or extract keywords from page text,\n'
+                '  description, category, title, or any other source.\n'
+                '  The ONLY valid source for keywords is the PRE-EXTRACTED FIELDS hint.\n'
+                '  If unsure, return null.\n'
                 '  NEVER include address components (street names, city names, zip codes,\n'
                 '  state abbreviations, road types like blvd/ave/st) in keywords.\n'
                 '  NEVER include directory navigation terms (maps, location, trip, venue).'
@@ -1969,18 +1972,14 @@ def extract_fields(
                 extracted["Category"] = hints["category"]
 
         # Keywords: prefer hint (already cleaned); clean whatever AI returned
+        # Keywords: ONLY from meta keywords tag hint — never from Gemini inference
         if "Keywords" in fields:
             hint_kw = hints.get("keywords", "")
-            ai_kw = extracted.get("Keywords", "") or ""
             if hint_kw:
-                # Use cleaned hint — authoritative (from meta tag only)
+                # Meta keywords tag existed and had content — use cleaned hint (authoritative)
                 extracted["Keywords"] = hint_kw
-            elif not _ai_empty(ai_kw):
-                # AI returned something despite no hint — clean it but keep
-                cleaned = _clean_keywords(ai_kw)
-                extracted["Keywords"] = cleaned if cleaned else None
             else:
-                # No hint, no AI value → null
+                # No meta keywords tag on this page — always null, discard Gemini's answer
                 extracted["Keywords"] = None
 
         # Structured-data field overrides for enrollbusiness
