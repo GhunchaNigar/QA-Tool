@@ -6,6 +6,15 @@ Two-layer scraping strategy:
 
 The Playwright layer calls playwright_worker.py as a child process so
 it gets its own event loop — no asyncio conflicts with Streamlit/Windows.
+
+Per-domain enhancements added for:
+  - askmap.net          (static, custom CSS selectors)
+  - brownbook.net       (JS-render + geo/cookie headers)
+  - freelistingusa.com  (static, thin-page threshold override)
+  - hotfrog.com         (heavy SPA — render=true, premium, long wait)
+  - nearfinderus.com    (JS-render, already handled — tuned wait)
+  - smallbusinessusa.com (moderate JS — render=true, wait for .business-info)
+  - us.enrollbusiness.com (JS-render, already handled — tuned wait)
 """
 
 import re
@@ -17,10 +26,21 @@ from bs4 import BeautifulSoup
 
 SCRAPERAPI_ENDPOINT = "http://api.scraperapi.com"
 
+# ── Per-domain render strategy ────────────────────────────────────────────────
+
+# Domains that must use render=true on the FIRST attempt (JS-heavy SPAs)
 JS_RENDER_FIRST_DOMAINS = [
     "nearfinderus.com",
     "us.enrollbusiness.com",
-    "band.us",
+    "hotfrog.com",
+    "smallbusinessusa.com",
+    "brownbook.net",
+]
+
+# Domains where render=false is sufficient (static HTML)
+STATIC_DOMAINS = [
+    "askmap.net",
+    "freelistingusa.com",
 ]
 
 # Per-domain render settings: wait (ms) and CSS selector to wait for
@@ -30,25 +50,84 @@ JS_RENDER_CONFIG = {
         "wait_for_selector": "h1",
     },
     "us.enrollbusiness.com": {
+        "wait": "18000",
+        "wait_for_selector": "h1",
+    },
+    "hotfrog.com": {
+        "wait": "20000",
+        "wait_for_selector": "h1",
+        "premium_first": True,   # force premium on first render attempt
+    },
+    "smallbusinessusa.com": {
+        "wait": "15000",
+        "wait_for_selector": "body",
+    },
+    "brownbook.net": {
         "wait": "15000",
         "wait_for_selector": "h1",
     },
 }
 
+# Per-domain minimum content thresholds (chars).
+# Some directory pages are intentionally sparse but still valid.
+DOMAIN_MIN_CHARS = {
+    "askmap.net":        150,
+    "freelistingusa.com": 100,
+    "smallbusinessusa.com": 150,
+}
+
+# Per-domain custom HTTP headers forwarded via ScraperAPI keep_headers
+DOMAIN_HEADERS = {
+    "brownbook.net": {
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+}
+
+
+# ── Attempt order ─────────────────────────────────────────────────────────────
+
 def _get_attempt_order(url: str) -> list:
-    """Return scrape attempt order — JS-heavy sites get render=true first."""
+    """Return scrape attempt list for a URL.
+
+    Rules (checked in order):
+      1. Static-only domains  → render=false only
+      2. JS-render-first      → render=true (possibly premium first), then fallbacks
+      3. Default              → render=false first, then render=true, then premium
+    """
     url_lower = url.lower()
+
+    if any(d in url_lower for d in STATIC_DOMAINS):
+        return [
+            dict(render=False, premium=False, label="render=false"),
+        ]
+
     if any(d in url_lower for d in JS_RENDER_FIRST_DOMAINS):
+        domain_cfg = next(
+            (JS_RENDER_CONFIG[d] for d in JS_RENDER_CONFIG if d in url_lower), {}
+        )
+        premium_first = domain_cfg.get("premium_first", False)
+        if premium_first:
+            return [
+                dict(render=True, premium=True,  label="render=true+premium"),
+                dict(render=True, premium=False, label="render=true"),
+                dict(render=False, premium=False, label="render=false"),
+            ]
         return [
             dict(render=True,  premium=False, label="render=true"),
             dict(render=True,  premium=True,  label="render=true+premium"),
             dict(render=False, premium=False, label="render=false"),
         ]
+
+    # Default fallback order
     return [
         dict(render=False, premium=False, label="render=false"),
         dict(render=True,  premium=False, label="render=true"),
         dict(render=True,  premium=True,  label="render=true+premium"),
     ]
+
+
+# ── Block-signal detection ────────────────────────────────────────────────────
 
 BLOCK_SIGNALS = [
     "captcha",
@@ -61,7 +140,21 @@ BLOCK_SIGNALS = [
     "please enable cookies",
     "security check",
     "access to this page has been denied",
+    "403 forbidden",
+    "robot or human",
+    "i am not a robot",
+    "please verify",
 ]
+
+# Signals that indicate a page returned the site's home/listing page rather
+# than the actual business profile (redirect to root on unknown slug).
+REDIRECT_SIGNALS = {
+    "freelistingusa.com":  ["search results", "find local business", "add your business free"],
+    "smallbusinessusa.com": ["small business directory", "find a business", "browse categories"],
+    "askmap.net":          ["search for places", "add your business"],
+    "hotfrog.com":         ["find a", "search results", "business directory"],
+    "brownbook.net":       ["business directory", "find businesses"],
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -71,14 +164,38 @@ def _is_blocked(html: str, text: str) -> bool:
     return any(signal in combined for signal in BLOCK_SIGNALS)
 
 
-def _is_thin(text: str, min_chars: int = 200) -> bool:
-    return len(text.strip()) < min_chars
+def _is_redirected(url: str, text: str) -> bool:
+    """Detect when the site silently redirected to its home/search page."""
+    url_lower = url.lower()
+    text_lower = text[:2000].lower()
+    for domain, signals in REDIRECT_SIGNALS.items():
+        if domain in url_lower:
+            hits = sum(1 for s in signals if s in text_lower)
+            if hits >= 2:
+                return True
+    return False
+
+
+def _min_chars_for(url: str, default: int = 200) -> int:
+    url_lower = url.lower()
+    for domain, threshold in DOMAIN_MIN_CHARS.items():
+        if domain in url_lower:
+            return threshold
+    return default
+
+
+def _is_thin(text: str, url: str = "") -> bool:
+    return len(text.strip()) < _min_chars_for(url)
 
 
 def _parse(html: str) -> tuple:
+    """Extract clean text and title from raw HTML.
+
+    Keeps header/nav elements because some directories (e.g. nearfinderus,
+    askmap) embed the business name / key info inside those elements.
+    Strips script, style, noscript, iframe, svg as before.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    # Do NOT strip header/nav — some directories (e.g. nearfinderus) put the
-    # business logo and key info inside those elements.
     for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
         tag.decompose()
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
@@ -87,12 +204,21 @@ def _parse(html: str) -> tuple:
     return text, title
 
 
+def _domain_extra_headers(url: str) -> dict:
+    url_lower = url.lower()
+    for domain, headers in DOMAIN_HEADERS.items():
+        if domain in url_lower:
+            return headers
+    return {}
+
+
 # ── Layer 1: ScraperAPI ───────────────────────────────────────────────────────
 
-def _scraperapi_fetch(url, api_key, render, premium=False, timeout=90):
+def _scraperapi_fetch(url: str, api_key: str, render: bool,
+                      premium: bool = False, timeout: int = 90):
     from urllib.parse import quote, urlencode
+
     # Manually encode the target URL to preserve special chars like +
-    # Using requests params= would corrupt + signs causing HTTP 500
     encoded_url = quote(url, safe="")
     qs = {
         "api_key":      api_key,
@@ -100,22 +226,26 @@ def _scraperapi_fetch(url, api_key, render, premium=False, timeout=90):
         "country_code": "us",
         "keep_headers": "true",
     }
+
     if render:
-        # Use per-domain config if available, else generic defaults
         url_lower = url.lower()
         domain_cfg = next(
             (cfg for domain, cfg in JS_RENDER_CONFIG.items() if domain in url_lower),
             {"wait": "12000", "wait_for_selector": "body"},
         )
         qs["wait_for_selector"] = domain_cfg["wait_for_selector"]
-        qs["wait"] = domain_cfg["wait"]
-        # Bump request timeout to exceed the wait time
+        qs["wait"]              = domain_cfg["wait"]
         timeout = max(timeout, int(domain_cfg["wait"]) // 1000 + 30)
+
     if premium:
         qs["premium"] = "true"
+
+    # Inject extra domain-specific headers when ScraperAPI keep_headers is on
+    extra_headers = _domain_extra_headers(url)
     full_url = f"{SCRAPERAPI_ENDPOINT}?{urlencode(qs)}&url={encoded_url}"
+
     try:
-        return requests.get(full_url, timeout=timeout)
+        return requests.get(full_url, headers=extra_headers, timeout=timeout)
     except Exception:
         return None
 
@@ -123,6 +253,7 @@ def _scraperapi_fetch(url, api_key, render, premium=False, timeout=90):
 def _scrape_via_scraperapi(url: str, api_key: str) -> dict:
     debug = ""
     attempts = _get_attempt_order(url)
+
     for attempt in attempts:
         resp = _scraperapi_fetch(url, api_key,
                                  render=attempt["render"],
@@ -131,9 +262,11 @@ def _scrape_via_scraperapi(url: str, api_key: str) -> dict:
             debug += f"[{attempt['label']}] timeout\n"
             time.sleep(2)
             continue
+
         if resp.status_code == 401:
             debug += "HTTP 401 — invalid ScraperAPI key\n"
             break
+
         if resp.status_code != 200:
             debug += f"[{attempt['label']}] HTTP {resp.status_code}\n"
             if resp.status_code == 429:
@@ -148,8 +281,14 @@ def _scrape_via_scraperapi(url: str, api_key: str) -> dict:
             debug += "  -> blocked/CAPTCHA\n"
             time.sleep(1)
             continue
-        if _is_thin(text):
+
+        if _is_thin(text, url):
             debug += f"  -> too thin ({len(text.strip())} chars)\n"
+            time.sleep(1)
+            continue
+
+        if _is_redirected(url, text):
+            debug += "  -> silently redirected to home/search page\n"
             time.sleep(1)
             continue
 
@@ -172,7 +311,15 @@ def _scrape_via_playwright(url: str, timeout_ms: int = 45000) -> dict:
     import sys
     import os
 
-    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playwright_worker.py")
+    # Playwright gets more time on JS-heavy domains
+    url_lower = url.lower()
+    for domain, cfg in JS_RENDER_CONFIG.items():
+        if domain in url_lower:
+            timeout_ms = max(timeout_ms, int(cfg["wait"]) + 10000)
+            break
+
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "playwright_worker.py")
     if not os.path.exists(worker):
         return {
             "success": False,
@@ -184,7 +331,7 @@ def _scrape_via_playwright(url: str, timeout_ms: int = 45000) -> dict:
             [sys.executable, worker, url, str(timeout_ms)],
             capture_output=True,
             text=True,
-            timeout=120,   # hard wall-clock limit
+            timeout=120,
             encoding="utf-8",
             errors="replace",
         )
@@ -195,7 +342,13 @@ def _scrape_via_playwright(url: str, timeout_ms: int = 45000) -> dict:
                 "success": False,
                 "debug": f"Playwright worker produced no output. stderr: {stderr_snippet}",
             }
-        return _json.loads(stdout)
+        result = _json.loads(stdout)
+        # Apply the same redirect guard to Playwright results too
+        if result.get("success") and _is_redirected(url, result.get("text", "")):
+            result["success"] = False
+            result["debug"]   = (result.get("debug", "") +
+                                  "\n  -> Playwright: silently redirected to home/search page")
+        return result
     except subprocess.TimeoutExpired:
         return {"success": False, "debug": "Playwright worker timed out (120s)"}
     except _json.JSONDecodeError as e:
@@ -219,7 +372,8 @@ def scrape_page(url: str, api_key: str) -> dict:
     result["_debug"] += "[ScraperAPI]\n" + sa.get("debug", "") + "\n"
 
     if sa["success"]:
-        result.update({"html": sa["html"], "text": sa["text"], "title": sa["title"]})
+        result.update({"html": sa["html"], "text": sa["text"],
+                        "title": sa["title"]})
         return result
 
     # Layer 2: Playwright
@@ -228,7 +382,8 @@ def scrape_page(url: str, api_key: str) -> dict:
     result["_debug"] += pw.get("debug", "") + "\n"
 
     if pw["success"]:
-        result.update({"html": pw["html"], "text": pw["text"], "title": pw["title"]})
+        result.update({"html": pw["html"], "text": pw["text"],
+                        "title": pw["title"]})
         return result
 
     result["error"] = (
