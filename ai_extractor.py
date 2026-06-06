@@ -778,14 +778,24 @@ def _extract_brownbook(soup) -> dict:
             break
 
     # Keywords from "Business tags" section
-    for tag in soup.find_all(["div", "section"]):
-        cls = _cls_str(tag)
-        heading = tag.find(["h2", "h3", "h4", "strong", "b"])
-        if heading and re.search(r"business\s*tags?", heading.get_text(strip=True), re.IGNORECASE):
-            links = tag.find_all("a")
-            kw_tokens = [a.get_text(strip=True) for a in links if a.get_text(strip=True)]
-            if kw_tokens:
-                out["keywords"] = _clean_keywords(", ".join(kw_tokens))
+   # Keywords from "Business tags" section
+    for heading in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
+        if re.search(r"business\s*tags?", heading.get_text(strip=True), re.IGNORECASE):
+            # Try siblings first (heading + sibling p/div/span)
+            for sib in heading.find_next_siblings(["p", "div", "span", "ul"]):
+                sib_text = sib.get_text(separator=", ", strip=True)
+                if sib_text and len(sib_text) < 200:
+                    out["keywords"] = _clean_keywords(sib_text)
+                    break
+            # Also try links inside parent container
+            if not out["keywords"]:
+                container = heading.parent
+                if container:
+                    links = container.find_all("a")
+                    kw_tokens = [a.get_text(strip=True) for a in links if a.get_text(strip=True)]
+                    if kw_tokens:
+                        out["keywords"] = _clean_keywords(", ".join(kw_tokens))
+            if out["keywords"]:
                 break
     # Fallback: meta keywords
     if not out["keywords"]:
@@ -869,24 +879,19 @@ def _extract_freelistingusa(soup) -> dict:
             break
 
     # Keywords from "Tags:" label or tags section
-    for tag in soup.find_all(["div", "p", "span", "li"]):
-        cls = _cls_str(tag)
-        txt = tag.get_text(separator=" ", strip=True)
-        if re.search(r"^tags?\s*:", txt, re.IGNORECASE) or re.search(r"\btags?\b", cls):
-            # Strip the "Tags:" prefix and extract remaining text
-            kw_raw = re.sub(r"^tags?\s*:\s*", "", txt, flags=re.IGNORECASE).strip()
-            if kw_raw:
-                out["keywords"] = _clean_keywords(kw_raw)
-                break
-    # Also check for anchor tags inside a tags-labeled container
+   # Keywords from "Tags:" text anywhere on page
+    full_text = soup.get_text(separator="\n", strip=True)
+    tags_match = re.search(r"^tags?\s*:\s*(.+)$", full_text, re.IGNORECASE | re.MULTILINE)
+    if tags_match:
+        out["keywords"] = _clean_keywords(tags_match.group(1).strip())
+    # Also check DOM elements
     if not out["keywords"]:
-        for tag in soup.find_all(["div", "section", "p"]):
-            cls = _cls_str(tag)
-            if re.search(r"\btags?\b", cls):
-                links = tag.find_all("a")
-                kw_tokens = [a.get_text(strip=True) for a in links if a.get_text(strip=True)]
-                if kw_tokens:
-                    out["keywords"] = _clean_keywords(", ".join(kw_tokens))
+        for tag in soup.find_all(["div", "p", "span", "li"]):
+            txt = tag.get_text(separator=" ", strip=True)
+            if re.match(r"^tags?\s*:", txt, re.IGNORECASE):
+                kw_raw = re.sub(r"^tags?\s*:\s*", "", txt, flags=re.IGNORECASE).strip()
+                if kw_raw:
+                    out["keywords"] = _clean_keywords(kw_raw)
                     break
     # Fallback: meta keywords
     if not out["keywords"]:
@@ -988,23 +993,35 @@ def _extract_hotfrog(soup) -> dict:
             break
 
     # Keywords from "Focal's Keywords" / "[Name]'s Keywords" section
-    # Hotfrog uses pipe-separated keywords: "ChatGPT Ads | ChatGPT Ads Agency"
+    # Keywords from "[Name]'s Keywords" heading section
     for heading in soup.find_all(["h2", "h3", "h4", "strong", "b", "p"]):
         htxt = heading.get_text(strip=True)
         if re.search(r"keywords?", htxt, re.IGNORECASE):
-            # Try sibling text or next element
-            for sib in heading.find_next_siblings(["p", "div", "span", "ul"]):
-                text = sib.get_text(separator=" | ", strip=True)
-                if text and len(text) < 300:
-                    # Convert pipe-separated to comma-separated
+            # Check siblings
+            for sib in heading.find_next_siblings():
+                text = sib.get_text(separator=", ", strip=True)
+                if text and len(text) < 300 and not re.search(r"keywords?", text, re.IGNORECASE):
                     kw_raw = re.sub(r"\s*\|\s*", ", ", text)
                     cleaned = _clean_keywords(kw_raw)
                     if cleaned:
                         out["keywords"] = cleaned
                         break
+            # Check if keywords are in the same tag after the heading word
+            if not out["keywords"]:
+                parent = heading.parent
+                if parent:
+                    parent_text = parent.get_text(separator="\n", strip=True)
+                    kw_match = re.search(
+                        r"keywords?\s*\n(.+?)(?:\n|$)", parent_text, re.IGNORECASE
+                    )
+                    if kw_match:
+                        kw_raw = re.sub(r"\s*\|\s*", ", ", kw_match.group(1).strip())
+                        cleaned = _clean_keywords(kw_raw)
+                        if cleaned:
+                            out["keywords"] = cleaned
             if out["keywords"]:
                 break
-    # Fallback: check JSON-LD keywords field
+    # Fallback: JSON-LD keywords
     if not out["keywords"] and ld:
         kw_val = ld.get("keywords", "")
         if isinstance(kw_val, list):
@@ -1666,6 +1683,35 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
         hints["gbp_link"]         = domain_out.get("gbp_link", "")
         hints["category"]         = domain_out.get("category", "")
         hints["keywords"]         = domain_out.get("keywords", "")
+
+        # Universal keyword fallback: scan raw page text for "Tags:" or "Business tags" patterns
+        if not hints["keywords"]:
+            # Try "Tags: val1, val2" pattern in page text
+            tags_match = re.search(
+                r"(?:^|\n)\s*tags?\s*:\s*([^\n]{3,200})",
+                page_text, re.IGNORECASE
+            )
+            if tags_match:
+                hints["keywords"] = _clean_keywords(tags_match.group(1).strip())
+
+        if not hints["keywords"]:
+            # Try "Business tags\nval1, val2" pattern (brownbook style)
+            bt_match = re.search(
+                r"business\s+tags?\s*\n([^\n]{3,200})",
+                page_text, re.IGNORECASE
+            )
+            if bt_match:
+                hints["keywords"] = _clean_keywords(bt_match.group(1).strip())
+
+        if not hints["keywords"]:
+            # Try hotfrog "[Name]'s Keywords\nval1 | val2" pattern
+            kw_match = re.search(
+                r"keywords?\s*\n([^\n]{3,200})",
+                page_text, re.IGNORECASE
+            )
+            if kw_match:
+                kw_raw = re.sub(r"\s*\|\s*", ", ", kw_match.group(1).strip())
+                hints["keywords"] = _clean_keywords(kw_raw)
 
         for f in ("name", "phone", "street", "city", "state", "zip", "country"):
             hints[f] = domain_out.get(f, "")
