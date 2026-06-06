@@ -720,7 +720,8 @@ def _extract_askmap(soup) -> dict:
 
 def _extract_brownbook(soup) -> dict:
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": "", "category": ""}
+           "social_links": "", "gbp_link": "", "category": "",
+           "keywords": ""}
 
     desc = _itemprop(soup, "description")
     if _good_desc(desc):
@@ -776,6 +777,22 @@ def _extract_brownbook(soup) -> dict:
             out["gbp_link"] = a["href"]
             break
 
+    # Keywords from "Business tags" section
+    for tag in soup.find_all(["div", "section"]):
+        cls = _cls_str(tag)
+        heading = tag.find(["h2", "h3", "h4", "strong", "b"])
+        if heading and re.search(r"business\s*tags?", heading.get_text(strip=True), re.IGNORECASE):
+            links = tag.find_all("a")
+            kw_tokens = [a.get_text(strip=True) for a in links if a.get_text(strip=True)]
+            if kw_tokens:
+                out["keywords"] = _clean_keywords(", ".join(kw_tokens))
+                break
+    # Fallback: meta keywords
+    if not out["keywords"]:
+        meta_kw = soup.find("meta", attrs={"name": "keywords"})
+        if meta_kw:
+            out["keywords"] = _clean_keywords(meta_kw.get("content", ""))
+
     return out
 
 
@@ -783,7 +800,8 @@ def _extract_brownbook(soup) -> dict:
 
 def _extract_freelistingusa(soup) -> dict:
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": "", "category": ""}
+           "social_links": "", "gbp_link": "", "category": "",
+           "keywords": ""}
 
     for tag in soup.find_all(["div", "p", "section"]):
         cls = _cls_str(tag)
@@ -850,6 +868,32 @@ def _extract_freelistingusa(soup) -> dict:
             out["gbp_link"] = a["href"]
             break
 
+    # Keywords from "Tags:" label or tags section
+    for tag in soup.find_all(["div", "p", "span", "li"]):
+        cls = _cls_str(tag)
+        txt = tag.get_text(separator=" ", strip=True)
+        if re.search(r"^tags?\s*:", txt, re.IGNORECASE) or re.search(r"\btags?\b", cls):
+            # Strip the "Tags:" prefix and extract remaining text
+            kw_raw = re.sub(r"^tags?\s*:\s*", "", txt, flags=re.IGNORECASE).strip()
+            if kw_raw:
+                out["keywords"] = _clean_keywords(kw_raw)
+                break
+    # Also check for anchor tags inside a tags-labeled container
+    if not out["keywords"]:
+        for tag in soup.find_all(["div", "section", "p"]):
+            cls = _cls_str(tag)
+            if re.search(r"\btags?\b", cls):
+                links = tag.find_all("a")
+                kw_tokens = [a.get_text(strip=True) for a in links if a.get_text(strip=True)]
+                if kw_tokens:
+                    out["keywords"] = _clean_keywords(", ".join(kw_tokens))
+                    break
+    # Fallback: meta keywords
+    if not out["keywords"]:
+        meta_kw = soup.find("meta", attrs={"name": "keywords"})
+        if meta_kw:
+            out["keywords"] = _clean_keywords(meta_kw.get("content", ""))
+
     return out
 
 
@@ -857,7 +901,8 @@ def _extract_freelistingusa(soup) -> dict:
 
 def _extract_hotfrog(soup) -> dict:
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": "", "category": ""}
+           "social_links": "", "gbp_link": "", "category": "",
+           "keywords": ""}
 
     ld_blocks = _extract_json_ld(soup)
     ld = _ld_find(ld_blocks, "LocalBusiness", "Organization", "Store",
@@ -941,6 +986,36 @@ def _extract_hotfrog(soup) -> dict:
                 p in a["href"] for p in ("maps/place", "maps?q", "goo.gl")):
             out["gbp_link"] = a["href"]
             break
+
+    # Keywords from "Focal's Keywords" / "[Name]'s Keywords" section
+    # Hotfrog uses pipe-separated keywords: "ChatGPT Ads | ChatGPT Ads Agency"
+    for heading in soup.find_all(["h2", "h3", "h4", "strong", "b", "p"]):
+        htxt = heading.get_text(strip=True)
+        if re.search(r"keywords?", htxt, re.IGNORECASE):
+            # Try sibling text or next element
+            for sib in heading.find_next_siblings(["p", "div", "span", "ul"]):
+                text = sib.get_text(separator=" | ", strip=True)
+                if text and len(text) < 300:
+                    # Convert pipe-separated to comma-separated
+                    kw_raw = re.sub(r"\s*\|\s*", ", ", text)
+                    cleaned = _clean_keywords(kw_raw)
+                    if cleaned:
+                        out["keywords"] = cleaned
+                        break
+            if out["keywords"]:
+                break
+    # Fallback: check JSON-LD keywords field
+    if not out["keywords"] and ld:
+        kw_val = ld.get("keywords", "")
+        if isinstance(kw_val, list):
+            kw_val = ", ".join(kw_val)
+        if isinstance(kw_val, str) and kw_val:
+            out["keywords"] = _clean_keywords(kw_val)
+    # Fallback: meta keywords
+    if not out["keywords"]:
+        meta_kw = soup.find("meta", attrs={"name": "keywords"})
+        if meta_kw:
+            out["keywords"] = _clean_keywords(meta_kw.get("content", ""))
 
     return out
 
@@ -1105,7 +1180,7 @@ def _extract_nearfinderus(soup) -> dict:
                         for p in paragraphs
                         if not _is_hidden_tag(p)
                     )
-                    if _good_desc(combined) and len(combined) > len(out["description_text"]):
+                    if combined and len(combined) > 50 and len(combined) > len(out["description_text"]):
                         out["description_text"] = combined
                         break
                     # Also try siblings of the heading
@@ -1113,11 +1188,9 @@ def _extract_nearfinderus(soup) -> dict:
                         if _is_hidden_tag(sib):
                             continue
                         text = sib.get_text(separator=" ", strip=True)
-                        if _good_desc(text, min_len=200) and len(text) > len(out["description_text"]):
+                        if text and len(text) > 50 and len(text) > len(out["description_text"]):
                             out["description_text"] = text
                             break
-                    if out["description_text"] and len(out["description_text"]) >= 300:
-                        break
 
     # Strategy B (FIX v7): scan ALL <p> tags from the bottom up for a long description
     if not out["description_text"] or len(out["description_text"]) < 300:
@@ -1126,7 +1199,7 @@ def _extract_nearfinderus(soup) -> dict:
             if _is_hidden_tag(p):
                 continue
             text = p.get_text(separator=" ", strip=True)
-            if _good_desc(text, min_len=200) and len(text) > len(out["description_text"]):
+            if text and len(text) > 100 and len(text) > len(out["description_text"]):
                 out["description_text"] = text
                 break
 
