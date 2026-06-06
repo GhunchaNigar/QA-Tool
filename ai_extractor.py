@@ -4,27 +4,27 @@ Sends scraped page content to Google Gemini and extracts
 business fields as JSON — including visual fields (Logo, Photos).
 No hardcoded layout assumptions. Gemini searches the whole page.
 
-v6 — Bug-fixes over v5:
-  - nearfinderus / all domains:
-      Description fix: strengthened _good_desc() to reject strings that
-      look like addresses (contain street-number + road-type tokens) even
-      when they don't start with a digit. Also added a minimum word-count
-      guard (>= 8 words) so short address fragments never pass.
-  - nearfinderus — Hours: the hours container selector was matching an
-      "address" section on nearfinderus (div class contains "address" which
-      also matched the regex). Added explicit exclusion of containers whose
-      class/id contains "address" when scanning for hours. Also added a
-      guard so the hours value is rejected if it contains a phone number
-      (i.e. the scraper grabbed the address+phone block instead).
-  - enrollbusiness — all NULL: added JSON-LD + microdata pre-pass inside
-      _extract_enrollbusiness so even a partially-rendered page can yield
-      Name/Phone/Address/Category/Hours from structured data before
-      falling back to DOM scanning.
-  - Keywords: added _clean_keywords() that strips address-like tokens
-      (street names, zip codes, city names repeated from the address)
-      from meta-keyword strings, keeping only genuine categorical tags.
-  - build_prompt: Keywords field instructions updated to clarify that
-      address tokens must not appear in keywords output.
+v7 — Bug-fixes over v6:
+  - nearfinderus — Keywords: now ONLY extracted from <meta name="keywords">.
+      If the page has no meta keywords tag, keywords stays empty and Gemini is
+      told explicitly NOT to infer/guess keywords (return null). Previously
+      Gemini was hallucinating keywords from the page text.
+  - nearfinderus — Description: added Priority 5 which scrapes the FULL text
+      from the "More about BUSINESS in City" section rendered at the bottom of
+      the page. This avoids the "See More" truncation that cut descriptions at
+      ~200 chars. Also added a reversed-<p> scan as a secondary fallback.
+  - nearfinderus — Hours: the day-pattern fallback now rejects any candidate
+      that (a) contains the word "review" but no HH:MM time, or (b) contains
+      day-names but no actual time info (no HH:MM, no am/pm, no open/closed).
+      This prevents the "Reviews|0.0 (0 reviews)|Write a review" block from
+      being returned as hours.
+  - enrollbusiness — all-NULL fallback: added _parse_enrollbusiness_slug() that
+      extracts Name, City, State, Zipcode from the URL path when JS rendering
+      yields zero content. Applied as absolute last resort in extract_fields().
+  - build_prompt — Keywords rule updated: if no KEYWORDS hint is present,
+      Gemini is now explicitly told to return null (not to infer from page text).
+  - scraper.py config note: enrollbusiness wait should be 25000ms with selector
+      ".profile-home, h1, [class*='business-name']" for better JS hydration.
 """
 
 import json
@@ -89,16 +89,12 @@ _ADDRESS_LIKE = re.compile(
     re.IGNORECASE,
 )
 
-# FIX v5: placeholder hours pattern — both open and close are midnight
 _PLACEHOLDER_HOURS = re.compile(
     r"^0{1,2}:0{2}\s*to\s*0{1,2}:0{2}$"
 )
 
-# FIX v6: phone-number pattern — used to reject hours values that are actually
-# the address+phone block (common nearfinderus false-positive)
 _PHONE_IN_TEXT = re.compile(r"\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}")
 
-# FIX v6: road-type tokens used to detect address strings in description/keywords
 _ROAD_TYPES = re.compile(
     r"\b(blvd|boulevard|street|st\b|avenue|ave\b|road\b|rd\b|lane\b|ln\b|"
     r"drive\b|dr\b|way\b|court\b|ct\b|place\b|pl\b|circle\b|cir\b|"
@@ -439,19 +435,6 @@ _BAD_DESC_PHRASES = (
 
 
 def _good_desc(text: str, min_len: int = 60) -> bool:
-    """
-    FIX v6: Strengthened address detection.
-    - Minimum word count raised to 8 (address fragments are short).
-    - Road-type token density check now also rejects strings with fewer
-      than 8 words that contain ANY road-type token (e.g. "300 Triple
-      Diamond Blvd Nokomis FL 34275" passes old regex but is clearly an
-      address). For texts with 8+ words the density threshold is kept.
-    - Reject any string that contains a 5-digit ZIP preceded by a 2-letter
-      state abbreviation (e.g. "FL 34275") — that's an address fragment.
-    - Normalise em-dashes / en-dashes to spaces before tokenising so that
-      "103 Triple Diamond Boulevard – Suite #1 Nokomis – FL – 34275"
-      is treated the same as "103 Triple Diamond Boulevard, Suite #1...".
-    """
     if len(text) < min_len:
         return False
 
@@ -460,26 +443,19 @@ def _good_desc(text: str, min_len: int = 60) -> bool:
     if any(b in tl for b in _BAD_DESC_PHRASES):
         return False
 
-    # Original address-start check
     if _ADDRESS_LIKE.match(text):
         return False
 
-    # Normalise em/en dashes to spaces for word-count and token checks
     normalised = re.sub(r"[–—]", " ", text)
     words = normalised.split()
     word_count = len(words)
 
-    # FIX v6: reject short strings (< 12 words after dash-normalisation)
-    # containing ANY road-type token
     if word_count < 12 and _ROAD_TYPES.search(normalised):
         return False
 
-    # FIX v6: reject strings containing "ST 12345" or "FL 34275" patterns
-    # (two-letter state code followed by 5-digit ZIP) — works with dashes too
     if re.search(r"\b[A-Z]{2}\s+\d{5}\b", normalised):
         return False
 
-    # FIX v6: reject strings that contain a bare 5-digit ZIP code
     if re.search(r"\b\d{5}\b", normalised):
         return False
 
@@ -506,10 +482,9 @@ def _longest_good_para(soup) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIX v6: Keywords cleaner
+#  Keywords cleaner
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Tokens that are clearly address components and should be stripped from keywords
 _ADDRESS_TOKEN_PATTERNS = re.compile(
     r"^\s*(\d{3,}.*|.*\b(blvd|boulevard|street|avenue|ave|road|lane|drive|"
     r"way|court|place|circle|parkway|highway|suite|ste)\b.*|"
@@ -517,7 +492,6 @@ _ADDRESS_TOKEN_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Common directory meta-keyword noise words
 _KEYWORD_NOISE = re.compile(
     r"^(address details|roadmap|satellite map|phone number|business hours|"
     r"trip planner?|travel|maps?|location|venue|place|trip)\s*$",
@@ -526,22 +500,6 @@ _KEYWORD_NOISE = re.compile(
 
 
 def _clean_keywords(raw_keywords: str, business_name: str = "") -> str:
-    """
-    FIX v6: Strip address tokens and directory noise from a comma-separated
-    keywords string, keeping only genuine categorical / business-type tags.
-
-    Strategy:
-      1. Split on commas.
-      2. Reject tokens that match address patterns (street addresses, zip codes,
-         city+state strings, road type tokens).
-      3. Reject tokens that are pure directory-navigation noise.
-      4. Reject tokens that are an exact (case-insensitive) match for the
-         business name — that's not a keyword.
-      5. Reject tokens that look like a place name (single or two words that
-         don't contain any service/industry terminology) — heuristic guard
-         against city names slipping through.
-      6. Return the survivors joined by ", ".
-    """
     if not raw_keywords:
         return ""
     tokens = [t.strip() for t in raw_keywords.split(",") if t.strip()]
@@ -549,30 +507,20 @@ def _clean_keywords(raw_keywords: str, business_name: str = "") -> str:
     cleaned = []
     for tok in tokens:
         tl = tok.lower()
-        # Skip address-pattern tokens (contains road type or looks like address)
         if _ADDRESS_TOKEN_PATTERNS.match(tok):
             continue
-        # Skip directory noise
         if _KEYWORD_NOISE.match(tok):
             continue
-        # Skip tokens that contain a 5-digit zip
         if re.search(r"\b\d{5}\b", tok):
             continue
-        # Skip tokens that look like a city+state combo  e.g. "nokomis, fl"
         if re.match(r"^[a-z\s]+,?\s+[a-z]{2}$", tok, re.IGNORECASE):
             continue
-        # Skip standalone 2-letter state abbreviations
         if re.match(r"^[a-z]{2}$", tok, re.IGNORECASE):
             continue
-        # Skip bare 5-digit zip codes
         if re.match(r"^\d{5}(-\d{4})?$", tok):
             continue
-        # Skip tokens that exactly match the business name
         if bn_lower and tl == bn_lower:
             continue
-        # Skip pure place-name tokens: 1-2 word tokens with no service/industry
-        # keywords in them. We keep tokens that contain at least one word from
-        # a broad service vocabulary.
         words_in_tok = tl.split()
         if len(words_in_tok) <= 2:
             service_words = re.compile(
@@ -586,13 +534,8 @@ def _clean_keywords(raw_keywords: str, business_name: str = "") -> str:
                 r"technology|software|hardware|network|cloud|digital)",
                 re.IGNORECASE,
             )
-            # A token like "nokomis" (a city) has no service word → skip
             if not service_words.search(tl) and _ROAD_TYPES.search(tl) is None:
-                # It could still be a valid single-word category like "plumbing"
-                # Only skip if it's clearly a proper noun (title-case, no digits)
                 if re.match(r"^[A-Z][a-z]+$", tok) or re.match(r"^[a-z]+$", tok):
-                    # Allow if it appears to be an industry term (falls through
-                    # the service_words check above) — skip otherwise
                     if not service_words.search(tl):
                         continue
         cleaned.append(tok)
@@ -604,13 +547,6 @@ def _clean_keywords(raw_keywords: str, business_name: str = "") -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_category_generic(soup) -> str:
-    """
-    Try several generic strategies to extract the business category:
-      1. itemprop="category"
-      2. JSON-LD additionalType / knowsAbout
-      3. Breadcrumb last item (often the category)
-      4. <meta name="keywords"> first token
-    """
     cat = _itemprop(soup, "category")
     if cat and len(cat) < 80:
         return cat
@@ -717,7 +653,6 @@ def _extract_askmap(soup) -> dict:
                 if out["description_text"]:
                     break
 
-    # askmap "Info" section is a <div> after the <h3>Info</h3>
     if not out["description_text"]:
         info_h = soup.find(["h3", "h4", "strong"], string=re.compile(r"^\s*Info\s*$", re.I))
         if info_h:
@@ -732,7 +667,6 @@ def _extract_askmap(soup) -> dict:
 
     out["category"] = _extract_category_generic(soup)
 
-    # FIX v6: extract and clean keywords from meta-keywords tag
     meta_kw = soup.find("meta", attrs={"name": "keywords"})
     if meta_kw:
         raw_kw = meta_kw.get("content", "")
@@ -752,7 +686,6 @@ def _extract_askmap(soup) -> dict:
                     out["website_url"] = href
                     break
     if not out["website_url"]:
-        # askmap puts the website in a plain <a> after the phone icon
         www_img = soup.find("img", src=re.compile(r"website|www|globe|web", re.I))
         if www_img:
             parent_a = www_img.find_parent("a")
@@ -1086,27 +1019,21 @@ def _extract_smallbusinessusa(soup) -> dict:
 
 def _extract_nearfinderus(soup) -> dict:
     """
-    FIX v6 — Description:
-      The old logic could pick up an address string like
-      "103 Triple Diamond Boulevard – Suite #1 Nokomis – FL – 34275"
-      because _good_desc() didn't catch dashes-instead-of-commas address
-      formats. The strengthened _good_desc() in v6 rejects any short
-      string containing road-type tokens OR a state+ZIP pattern, so
-      those strings are now filtered out before they can be returned.
-
-    FIX v6 — Hours:
-      Added an explicit guard: after extraction, if the candidate hours
-      string contains a phone number pattern (common false-positive on
-      nearfinderus where the address+phone block is in a div that also
-      matches the "address" container), it is discarded.
-      Also added "address" to the exclusion list for the hours container
-      class scan so we never pick up the address/contact block.
+    FIX v7:
+      Keywords: ONLY from <meta name="keywords"> — never guessed.
+      Description: added Priority 5 — scrapes the full text from the
+        "More about BUSINESS in City" section at the bottom of the page,
+        which avoids the "See More" clamp on the top snippet.
+      Hours: day-pattern fallback now rejects text that contains "review"
+        but no HH:MM time, and also rejects text with no real time info.
     """
     from urllib.parse import unquote
     out = {"description_text": "", "website_url": "", "hours": "",
-           "social_links": "", "gbp_link": "", "category": ""}
+           "social_links": "", "gbp_link": "", "category": "",
+           "keywords": ""}
 
     # ── Description ──
+
     # Priority 1: "More about" / "About" heading sibling paragraphs
     for h in soup.find_all(["h2", "h3", "h4", "strong", "b", "p"]):
         htxt = h.get_text(strip=True).lower()
@@ -1158,9 +1085,50 @@ def _extract_nearfinderus(soup) -> dict:
                     out["description_text"] = text
                     break
 
-    # Priority 4: longest good paragraph (already uses strengthened _good_desc)
+    # Priority 4: longest good paragraph
     if not out["description_text"]:
         out["description_text"] = _longest_good_para(soup)
+
+    # Priority 5 (FIX v7): full text from the bottom "More about BUSINESS in City" section.
+    # nearfinderus truncates the description at the top with a "See More" button,
+    # but renders the COMPLETE text in a section near the bottom of the page.
+    # We prefer the longer version when the current extraction is short (<300 chars).
+    if not out["description_text"] or len(out["description_text"]) < 300:
+        # Strategy A: find a heading containing "More about" anywhere in the page
+        for heading_tag in soup.find_all(["h2", "h3", "h4", "strong"]):
+            if re.search(r"more\s+about", heading_tag.get_text(strip=True), re.IGNORECASE):
+                container = heading_tag.parent
+                if container:
+                    paragraphs = container.find_all("p")
+                    combined = " ".join(
+                        p.get_text(separator=" ", strip=True)
+                        for p in paragraphs
+                        if not _is_hidden_tag(p)
+                    )
+                    if _good_desc(combined) and len(combined) > len(out["description_text"]):
+                        out["description_text"] = combined
+                        break
+                    # Also try siblings of the heading
+                    for sib in heading_tag.find_next_siblings(["p", "div"]):
+                        if _is_hidden_tag(sib):
+                            continue
+                        text = sib.get_text(separator=" ", strip=True)
+                        if _good_desc(text, min_len=200) and len(text) > len(out["description_text"]):
+                            out["description_text"] = text
+                            break
+                    if out["description_text"] and len(out["description_text"]) >= 300:
+                        break
+
+    # Strategy B (FIX v7): scan ALL <p> tags from the bottom up for a long description
+    if not out["description_text"] or len(out["description_text"]) < 300:
+        all_paras = soup.find_all("p")
+        for p in reversed(all_paras):
+            if _is_hidden_tag(p):
+                continue
+            text = p.get_text(separator=" ", strip=True)
+            if _good_desc(text, min_len=200) and len(text) > len(out["description_text"]):
+                out["description_text"] = text
+                break
 
     # ── Category ──
     out["category"] = _extract_category_generic(soup)
@@ -1174,6 +1142,15 @@ def _extract_nearfinderus(soup) -> dict:
                     breadcrumb_links.append(txt)
         if breadcrumb_links:
             out["category"] = breadcrumb_links[-1]
+
+    # ── Keywords (FIX v7: ONLY from meta tag — never guessed) ──
+    meta_kw = soup.find("meta", attrs={"name": "keywords"})
+    if meta_kw:
+        raw_kw = meta_kw.get("content", "").strip()
+        if raw_kw:
+            out["keywords"] = _clean_keywords(raw_kw)
+    # If no meta keywords tag or empty content → out["keywords"] stays ""
+    # The build_prompt Keywords rule will tell Gemini to return null.
 
     # ── Website + Social via redirect wrapper ──
     social_links = []
@@ -1192,8 +1169,8 @@ def _extract_nearfinderus(soup) -> dict:
                 out["website_url"] = href
     out["social_links"] = ", ".join(dict.fromkeys(social_links))
 
-    # ── Hours (FIX v5 + v6) ──
-    #
+    # ── Hours ──
+
     # Priority 1: itemprop="openingHours" content attribute
     oh_tags = soup.find_all(attrs={"itemprop": "openingHours"})
     if oh_tags:
@@ -1209,12 +1186,11 @@ def _extract_nearfinderus(soup) -> dict:
         if hours_list:
             out["hours"] = "; ".join(hours_list)
 
-    # Priority 2: opening-hours table/list rows — skip placeholder rows
-    # FIX v6: also skip containers whose class/id contains "address"
+    # Priority 2: opening-hours table/list rows
     if not out["hours"]:
         for container in soup.find_all(["div", "section", "table", "ul"]):
             cls = _cls_str(container)
-            # FIX v6: skip address/contact containers
+            # Skip address/contact containers
             if re.search(r"\baddress\b|\bcontact\b|\bphone\b", cls):
                 continue
             if re.search(r"(hours|schedule|working|opening|open)", cls):
@@ -1231,7 +1207,6 @@ def _extract_nearfinderus(soup) -> dict:
                             hours_rows.append(": ".join(cells[:2]))
                     if hours_rows:
                         candidate = "; ".join(hours_rows)
-                        # FIX v6: reject if phone number leaked in
                         if not _PHONE_IN_TEXT.search(candidate):
                             out["hours"] = candidate
                         break
@@ -1239,12 +1214,11 @@ def _extract_nearfinderus(soup) -> dict:
                     text = container.get_text(separator="|", strip=True)
                     placeholder_count = len(re.findall(r"0{1,2}:0{2}\s*to\s*0{1,2}:0{2}", text))
                     if text and len(text) < 600 and placeholder_count == 0:
-                        # FIX v6: reject if phone number leaked in
                         if not _PHONE_IN_TEXT.search(text):
                             out["hours"] = text
                         break
 
-    # Priority 3: day-name pattern fallback
+    # Priority 3: day-name pattern fallback (FIX v7: reject reviews/non-time blocks)
     if not out["hours"]:
         day_pattern = re.compile(
             r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
@@ -1261,8 +1235,19 @@ def _extract_nearfinderus(soup) -> dict:
                 day_count = len(day_pattern.findall(text))
                 if placeholder_count > 0 and placeholder_count >= day_count:
                     continue
-                # FIX v6: reject if phone number leaked in
+                # Reject if phone number leaked in
                 if _PHONE_IN_TEXT.search(text):
+                    continue
+                # FIX v7: reject reviews block (contains "review" but no HH:MM time)
+                if (re.search(r"\breview", text, re.IGNORECASE) and
+                        not re.search(r"\d{1,2}:\d{2}", text)):
+                    continue
+                # FIX v7: require actual time info — must have HH:MM OR open/closed/am/pm
+                has_time_info = (
+                    re.search(r"\d{1,2}:\d{2}", text) or
+                    re.search(r"\b(open|closed|am|pm)\b", text, re.IGNORECASE)
+                )
+                if not has_time_info:
                     continue
                 out["hours"] = text
                 break
@@ -1279,49 +1264,107 @@ def _extract_nearfinderus(soup) -> dict:
 
 # ── us.enrollbusiness.com ─────────────────────────────────────────────────────
 
+def _parse_enrollbusiness_slug(url: str) -> dict:
+    """
+    FIX v7: Last-resort URL slug parser for enrollbusiness.
+    Parses Name, City, State, Zipcode from the URL path when JS rendering
+    yields zero content.
+
+    Example URL path segment:
+      WrightWay-Emergency-Services-Nokomis-FL-34275
+    → Name: "WrightWay Emergency Services"
+      City: "Nokomis"
+      State: "FL"
+      Zipcode: "34275"
+
+    Strategy:
+      1. Extract the last path segment after /BusinessProfile/<id>/
+      2. Split on hyphens.
+      3. Detect a 5-digit ZIP at the end → Zipcode.
+      4. Detect a 2-letter all-caps token just before ZIP → State.
+      5. The token before State is likely City (single word).
+      6. Everything before City → Name (rejoin with spaces).
+    """
+    out = {"name": "", "city": "", "state": "", "zip": ""}
+    try:
+        # Extract slug: everything after the numeric ID segment
+        match = re.search(r"/BusinessProfile/\d+/([^/?#]+)", url)
+        if not match:
+            return out
+        slug = match.group(1)
+        parts = slug.split("-")
+        if len(parts) < 3:
+            return out
+
+        # Work backwards: ZIP, State, City, then Name
+        zip_code = ""
+        state = ""
+        city_parts = []
+        name_parts = []
+
+        idx = len(parts) - 1
+
+        # Detect ZIP (5 digits)
+        if re.match(r"^\d{5}$", parts[idx]):
+            zip_code = parts[idx]
+            idx -= 1
+
+        # Detect State (2 uppercase letters)
+        if idx >= 0 and re.match(r"^[A-Z]{2}$", parts[idx]):
+            state = parts[idx]
+            idx -= 1
+
+        # Everything remaining is Name + City.
+        # Heuristic: the last remaining token before state is City (proper noun, title-case).
+        # We'll take the last 1 token as City (most enrollbusiness slugs have single-word city).
+        remaining = parts[:idx + 1]
+        if remaining:
+            city_parts = [remaining[-1]]
+            name_parts = remaining[:-1]
+
+        out["name"] = " ".join(name_parts) if name_parts else ""
+        out["city"] = " ".join(city_parts) if city_parts else ""
+        out["state"] = state
+        out["zip"] = zip_code
+    except Exception:
+        pass
+    return out
+
+
 def _extract_enrollbusiness(soup) -> dict:
     """
-    FIX v6: Added JSON-LD + microdata pre-pass so that even a
-    partially-rendered page (which causes all-NULL from DOM scanning)
-    can yield Name/Phone/Address/Category/Hours from structured data
-    embedded in the HTML before JavaScript fully executes.
+    FIX v6: Added JSON-LD + microdata pre-pass.
+    FIX v7: Slug parsing is handled in extract_fields() as last resort.
     """
     out = {"description_text": "", "website_url": "", "hours": "",
            "social_links": "", "gbp_link": "", "category": "",
-           # FIX v6: expose structured-data fields for upstream use
            "name": "", "phone": "", "street": "", "city": "",
            "state": "", "zip": "", "country": ""}
 
-    # ── FIX v6: JSON-LD structured data pre-pass ──
+    # ── JSON-LD structured data pre-pass ──
     ld_blocks = _extract_json_ld(soup)
     ld = _ld_find(ld_blocks, "LocalBusiness", "Organization", "Store",
                   "Restaurant", "Service", "ProfessionalService",
                   "HomeAndConstructionBusiness")
     if ld:
-        # Name
         if ld.get("name"):
             out["name"] = ld["name"]
-        # Phone
         for key in ("telephone", "phone"):
             if ld.get(key):
                 out["phone"] = ld[key]
                 break
-        # Address
         addr = _ld_address(ld)
         out["street"]  = addr.get("street", "")
         out["city"]    = addr.get("city", "")
         out["state"]   = addr.get("state", "")
         out["zip"]     = addr.get("zip", "")
         out["country"] = addr.get("country", "")
-        # Description
         desc = ld.get("description", "")
         if _good_desc(desc):
             out["description_text"] = desc
-        # Website
         url = ld.get("url", "")
         if url and not any(s in url for s in _SKIP_DOMAINS):
             out["website_url"] = url
-        # Hours
         hours_val = ld.get("openingHours", [])
         if isinstance(hours_val, list) and hours_val:
             out["hours"] = "; ".join(hours_val)
@@ -1341,7 +1384,6 @@ def _extract_enrollbusiness(soup) -> dict:
                         parts.append(f"{days}: {opens}–{closes}".strip())
                 if parts:
                     out["hours"] = "; ".join(parts)
-        # Category
         for key in ("additionalType", "knowsAbout", "serviceType", "@type"):
             val = ld.get(key, "")
             if isinstance(val, list):
@@ -1350,7 +1392,7 @@ def _extract_enrollbusiness(soup) -> dict:
                 out["category"] = val.split("/")[-1].replace("-", " ").replace("_", " ")
                 break
 
-    # ── FIX v6: microdata (itemprop) pre-pass ──
+    # ── Microdata (itemprop) pre-pass ──
     if not out["name"]:
         out["name"] = _itemprop(soup, "name")
     if not out["phone"]:
@@ -1380,7 +1422,7 @@ def _extract_enrollbusiness(soup) -> dict:
             if hours_list:
                 out["hours"] = "; ".join(hours_list)
 
-    # ── Original DOM-based extraction (as fallback) ──
+    # ── DOM-based extraction (fallback) ──
     if not out["description_text"]:
         for tag in soup.find_all(["div", "section", "article"]):
             cls = _cls_str(tag)
@@ -1420,7 +1462,6 @@ def _extract_enrollbusiness(soup) -> dict:
 
     if not out["hours"]:
         for tag in soup.find_all(["div", "section", "table", "li"]):
-            cls = _cls_str(tag)
             text = tag.get_text(separator=" ", strip=True)
             if re.search(r"(working hours|business hours|hours of operation|opening hours)", text, re.I):
                 if len(text) < 500:
@@ -1507,7 +1548,6 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
         "hours":            "",
         "category":         "",
         "keywords":         "",
-        # FIX v6: structured-data fields surfaced from enrollbusiness pre-pass
         "name":    "",
         "phone":   "",
         "street":  "",
@@ -1554,7 +1594,6 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
         hints["category"]         = domain_out.get("category", "")
         hints["keywords"]         = domain_out.get("keywords", "")
 
-        # FIX v6: surface structured-data fields from enrollbusiness
         for f in ("name", "phone", "street", "city", "state", "zip", "country"):
             hints[f] = domain_out.get(f, "")
 
@@ -1631,13 +1670,11 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
         pre_extracted_facts.append(
             f'CATEGORY (confirmed from page HTML — use as-is):\n{hints["category"]}'
         )
-    # FIX v6: surface cleaned keywords as an authoritative hint
     if hints["keywords"]:
         pre_extracted_facts.append(
             f'KEYWORDS (cleaned from page meta-keywords — use as-is, NO address tokens):\n'
             f'{hints["keywords"]}'
         )
-    # FIX v6: surface structured-data fields for enrollbusiness all-NULL fix
     for field_key, hint_key in [
         ("Name", "name"), ("Phone", "phone"), ("Street", "street"),
         ("City", "city"), ("State", "state"), ("Zipcode", "zip"),
@@ -1705,11 +1742,12 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
             field_rules.append(
                 '- "Keywords": business-type tags and service keywords ONLY.\n'
                 '  If KEYWORDS appears in PRE-EXTRACTED FIELDS above, use it directly.\n'
+                '  If NO KEYWORDS hint is present in PRE-EXTRACTED FIELDS, return null.\n'
+                '  DO NOT infer or guess keywords from the page text — only use explicit\n'
+                '  meta-keyword data. If unsure, return null.\n'
                 '  NEVER include address components (street names, city names, zip codes,\n'
                 '  state abbreviations, road types like blvd/ave/st) in keywords.\n'
-                '  NEVER include directory navigation terms (maps, location, trip, venue).\n'
-                '  Return comma-separated categorical terms only, e.g. "water damage restoration, '
-                'emergency services, mold remediation".'
+                '  NEVER include directory navigation terms (maps, location, trip, venue).'
             )
         elif f == "Description":
             field_rules.append(
@@ -1729,7 +1767,8 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
                 '  Format: e.g. "Mon-Fri 9am-5pm" or "Monday - Sunday: 24 Hours Open".\n'
                 '  NEVER return hours where every day shows "00:00 to 00:00" — '
                 'those are un-rendered placeholders; return null instead.\n'
-                '  NEVER return an address or phone number as hours.'
+                '  NEVER return an address or phone number as hours.\n'
+                '  NEVER return review text (e.g. "0 reviews", "Write a review") as hours.'
             )
         elif f == "Social Media Links":
             field_rules.append(
@@ -1781,8 +1820,8 @@ CRITICAL RULES:
 - For Website URL: NEVER return a cloudflare.com URL — return null if only cloudflare URLs exist.
 - For Description: NEVER return a bare address string or phone number as the description.
 - For Hours: NEVER return a value where every day shows "00:00 to 00:00" — return null instead.
-- For Hours: NEVER return an address or phone number as hours.
-- For Keywords: NEVER include street addresses, city names, zip codes, or state abbreviations.
+- For Hours: NEVER return an address, phone number, or review text as hours.
+- For Keywords: if no KEYWORDS hint exists in PRE-EXTRACTED FIELDS, return null — do NOT infer.
 
 FIELD INSTRUCTIONS:
 {rules_text}
@@ -1845,10 +1884,6 @@ def _call_gemini(client, prompt: str):
     raise last_err or RuntimeError("All Gemini models failed")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Helper: is the extracted result effectively all-null?
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _all_null(extracted: dict, fields: list) -> bool:
     for f in fields:
         if extracted.get(f) not in (None, "", "null"):
@@ -1893,7 +1928,6 @@ def extract_fields(
         # ── POST-PROCESS: authoritative overrides ─────────────────────────
         hints = _extract_page_hints(page_html, page_text, source)
 
-        # If Cloudflare challenge, null all fields
         if hints.get("cloudflare_blocked"):
             for f in fields:
                 extracted[f] = None
@@ -1901,7 +1935,6 @@ def extract_fields(
             extracted["_model"] = model_used
             return extracted
 
-        # Visual fields — always authoritative from HTML analysis
         if hints["logo_confirmed"] and "Logo" in fields:
             extracted["Logo"] = "PRESENT"
         if hints["photos_confirmed"] and "Photos" in fields:
@@ -1935,16 +1968,22 @@ def extract_fields(
             if _ai_empty(extracted.get("Category")):
                 extracted["Category"] = hints["category"]
 
-        # FIX v6: apply cleaned keywords override
-        if hints["keywords"] and "Keywords" in fields:
+        # Keywords: prefer hint (already cleaned); clean whatever AI returned
+        if "Keywords" in fields:
+            hint_kw = hints.get("keywords", "")
             ai_kw = extracted.get("Keywords", "") or ""
-            # Always prefer the cleaned hint over raw AI output (AI may include addr tokens)
-            cleaned = _clean_keywords(ai_kw if not _ai_empty(ai_kw) else hints["keywords"])
-            if not cleaned:
-                cleaned = hints["keywords"]
-            extracted["Keywords"] = cleaned if cleaned else extracted.get("Keywords")
+            if hint_kw:
+                # Use cleaned hint — authoritative (from meta tag only)
+                extracted["Keywords"] = hint_kw
+            elif not _ai_empty(ai_kw):
+                # AI returned something despite no hint — clean it but keep
+                cleaned = _clean_keywords(ai_kw)
+                extracted["Keywords"] = cleaned if cleaned else None
+            else:
+                # No hint, no AI value → null
+                extracted["Keywords"] = None
 
-        # FIX v6: apply structured-data field overrides for enrollbusiness all-NULL
+        # Structured-data field overrides for enrollbusiness
         if "enrollbusiness" in source.lower():
             for field_name, hint_key in [
                 ("Name", "name"), ("Phone", "phone"), ("Street", "street"),
@@ -1955,7 +1994,19 @@ def extract_fields(
                     if _ai_empty(extracted.get(field_name)):
                         extracted[field_name] = hints[hint_key]
 
-        # all-null warning
+        # FIX v7: enrollbusiness URL-slug fallback when everything is still null
+        if "enrollbusiness" in source.lower() and _all_null(extracted, fields):
+            slug_data = _parse_enrollbusiness_slug(source)
+            if slug_data.get("name") and "Name" in fields:
+                extracted["Name"] = slug_data["name"]
+            if slug_data.get("city") and "City" in fields:
+                extracted["City"] = slug_data["city"]
+            if slug_data.get("state") and "State" in fields:
+                extracted["State"] = slug_data["state"]
+            if slug_data.get("zip") and "Zipcode" in fields:
+                extracted["Zipcode"] = slug_data["zip"]
+            extracted["_slug_fallback"] = True
+
         if _all_null(extracted, fields) and (page_html or page_text):
             extracted["_all_null_warning"] = (
                 "Gemini returned null for all fields despite page content being present. "
@@ -1968,11 +2019,13 @@ def extract_fields(
             if "cloudflare.com" in url_val:
                 extracted["Website URL"] = None
 
-        # Final hours placeholder guard
+        # Final hours guard
         if "Hours" in fields:
             hours_val = extracted.get("Hours", "") or ""
-            # FIX v6: also reject hours that contain a phone number
             if _PHONE_IN_TEXT.search(hours_val):
+                extracted["Hours"] = None
+            elif re.search(r"\breview", hours_val, re.IGNORECASE) and not re.search(r"\d{1,2}:\d{2}", hours_val):
+                # FIX v7: reject review text masquerading as hours
                 extracted["Hours"] = None
             else:
                 real_time_segments = len(re.findall(r"\d{1,2}:\d{2}", hours_val))
@@ -1982,17 +2035,16 @@ def extract_fields(
                 if real_time_segments > 0 and placeholder_segments == real_time_segments:
                     extracted["Hours"] = None
 
-        # FIX v6: final keywords guard — strip address tokens from whatever Gemini returned
+        # Final keywords guard
         if "Keywords" in fields:
             kw_val = extracted.get("Keywords", "") or ""
             if kw_val:
                 extracted["Keywords"] = _clean_keywords(kw_val) or None
 
-        # FIX v6: final description guard — reject if it looks like an address
+        # Final description guard
         if "Description" in fields:
             desc_val = extracted.get("Description", "") or ""
             if desc_val and not _good_desc(desc_val):
-                # Try to fall back to hint; if hint also bad, set null
                 if hints["description_text"] and _good_desc(hints["description_text"]):
                     extracted["Description"] = hints["description_text"]
                 else:
