@@ -1343,7 +1343,6 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
         ("social",      "SOCIAL MEDIA LINKS"),
         ("gbp",         "GBP LINK"),
         ("category",    "CATEGORY"),
-        ("keywords",    "KEYWORDS (from meta tag only — use as-is)"),
     ]
     for hint_key, label in field_hint_map:
         val = hints.get(hint_key, "")
@@ -1470,7 +1469,7 @@ CRITICAL RULES:
 - Logo/Photos: if PRE-EXTRACTED confirms PRESENT, return "PRESENT" — do not second-guess.
 - Website URL: NEVER return a cloudflare.com URL.
 - Hours: NEVER return "00:00 to 00:00" placeholders — return null instead.
-- Keywords: ONLY from PRE-EXTRACTED FIELDS — never inferred from page content.
+- Keywords: search the entire page for "Business tags", "Tags", "Keywords" sections or pipe/comma-separated labels. Return comma-separated.
 - Name: NEVER return a website domain (e.g. "nearfinderus.com") as the business name.
 
 FIELD INSTRUCTIONS:
@@ -1609,11 +1608,6 @@ def extract_fields(
             if hints.get(hint_key) and field_name in fields:
                 if _empty(extracted.get(field_name)):
                     extracted[field_name] = hints[hint_key]
-
-        # Keywords: ONLY from meta tag — always override Gemini's answer
-        if "Keywords" in fields:
-            kw_hint = hints.get("keywords", "")
-            extracted["Keywords"] = _clean_keywords(kw_hint) if kw_hint else None
 
         # ── Final guards ───────────────────────────────────────────────────
 
