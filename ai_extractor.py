@@ -713,7 +713,39 @@ def _universal_category(soup) -> str:
     return ""
 
 
-def _universal_keywords(soup) -> str:
+"""
+PATCH: Replace the entire _universal_keywords() function in ai_extractor.py
+with this version.
+
+Changes vs original
+───────────────────
+1. Strategy A — "Business tags" heading → siblings only (not parent)
+   The original collected from the heading's PARENT container, which on brownbook
+   also contains the "Location tags" column.  We now walk only NEXT SIBLINGS of
+   the heading, stopping before any location-tag element.  The parent-container
+   fallback is kept but now skips descendants that live inside a location
+   sub-container (exclude_location_subtrees=True).
+
+2. _collect_tag_items() — exclude location sub-trees by default
+   New parameter `exclude_location_subtrees` (default True).  When set, any
+   child element whose ancestor chain (up to `container`) passes through a
+   location-tag container is silently skipped.  This is the surgical fix that
+   stops "Nokomis, Florida" leaking into business-tag results on brownbook.
+
+3. Strategy C — plain-text colon AND next-line patterns
+   Handles "Tags: Water Damage Restoration Service" inline (freelistingusa) and
+   the two-line "Tags\nWater Damage Restoration Service" FAQ-block variant.
+   Previously only the next-line regex was tried, and it required a blank line
+   between the label and the value.
+
+4. Strategy D — relaxed label matching
+   The original regex `^(tags?)$` required the label element to contain
+   ONLY the word "Tags".  The new version also matches when the element text
+   STARTS WITH "Tags" (e.g. "Tags:" with trailing colon inside the node),
+   catching more real-world patterns.
+"""
+
+def _universal_keywords(soup) -> str:  # noqa: C901
     """
     Keywords from:
       1. <meta name="keywords"> — highest priority, used verbatim
@@ -721,113 +753,145 @@ def _universal_keywords(soup) -> str:
 
     KEY RULES:
     - Never split multi-word tags on spaces (preserves "ChatGPT Ads Agency" intact)
-    - "Location tags" sibling containers are excluded (brownbook pattern)
+    - "Location tags" sibling containers and sub-trees are excluded
     - Only comma, pipe, semicolon, or period used as tag separators
     """
 
-    # ── Priority 1: meta keywords ──────────────────────────────────────────
-    meta_kw = soup.find("meta", attrs={"name": "keywords"})
-    if meta_kw:
-        raw = meta_kw.get("content", "").strip()
-        if raw:
-            return _clean_keywords(raw)
-
-    # ── Patterns ───────────────────────────────────────────────────────────
+    # ── Shared patterns ────────────────────────────────────────────────────────
     _BIZ_TAG_RE = re.compile(
         r"\b(business\s+tags?|tags?|keywords?|services?\s+offered)\b",
         re.IGNORECASE,
     )
-    # Location-flavored labels — containers/headings matching this are skipped
     _LOC_TAG_RE = re.compile(
         r"\b(location\s+tags?|location|city|cities|region|area|"
         r"local\s+tags?|geo\s+tags?)\b",
         re.IGNORECASE,
     )
 
-    def _collect_tag_items(container) -> list:
+    def _is_location_container(tag) -> bool:
+        cls = _cls_str(tag)
+        txt = tag.get_text(strip=True)[:80]
+        return bool(_LOC_TAG_RE.search(cls) or _LOC_TAG_RE.search(txt))
+
+    def _collect_tag_items(container, exclude_location_subtrees: bool = True) -> list:
         """
         Collect individual keyword/tag texts from a container.
-        Prefers <a> and <span> child tags (each tag = one keyword).
-        Falls back to splitting the plain text on comma/pipe/semicolon/period.
-        Never splits on spaces to preserve multi-word phrases.
+
+        exclude_location_subtrees=True (default): skip any child element whose
+        ancestor chain (up to `container`) passes through a location-tag node.
+        This prevents brownbook's "Location tags" column from contaminating
+        results when both columns share a parent wrapper.
+
+        Prefers <a>/<span>/<li> children (each element = one keyword).
+        Falls back to comma/pipe/semicolon splitting of plain text.
+        Never splits on spaces so multi-word phrases stay intact.
         """
         items = []
-        # Try child link/tag elements first — each child = one complete keyword
-        children = container.find_all(["a", "span", "li", "strong", "em"], recursive=True)
-        if children:
-            for child in children:
-                txt = child.get_text(strip=True)
-                # Skip if this is clearly a navigation link (has href pointing elsewhere)
-                if child.name == "a":
-                    href = child.get("href", "")
-                    if href and not href.startswith("#"):
-                        # External or internal nav link — skip
-                        if any(d in href for d in _SKIP_DOMAINS):
-                            continue
-                if txt and 2 < len(txt) < 100:
-                    items.append(txt)
+        children = container.find_all(
+            ["a", "span", "li", "strong", "em"], recursive=True
+        )
+        for child in children:
+            if exclude_location_subtrees:
+                in_loc = False
+                for ancestor in child.parents:
+                    if ancestor is container:
+                        break
+                    if hasattr(ancestor, "get") and _is_location_container(ancestor):
+                        in_loc = True
+                        break
+                if in_loc:
+                    continue
+
+            txt = child.get_text(strip=True)
+
+            if child.name == "a":
+                href = child.get("href", "")
+                if href and not href.startswith("#"):
+                    if any(d in href for d in _SKIP_DOMAINS):
+                        continue
+
+            if txt and 2 < len(txt) < 100:
+                items.append(txt)
+
         if items:
             return items
-        # Fallback: plain text split on separators (never on spaces)
+
+        # Fallback: split plain text on separators only (never spaces)
         raw = container.get_text(strip=True)
         parts = re.split(r"[,|;.]", raw)
         return [p.strip() for p in parts if p.strip() and 2 < len(p.strip()) < 100]
 
-    def _is_location_container(tag) -> bool:
-        """Return True if this tag looks like a location/geo tag container."""
-        cls = _cls_str(tag)
-        txt = tag.get_text(strip=True)[:60]
-        return bool(_LOC_TAG_RE.search(cls) or _LOC_TAG_RE.search(txt))
+    # ── Priority 1: <meta name="keywords"> ────────────────────────────────────
+    meta_kw = soup.find("meta", attrs={"name": "keywords"})
+    if meta_kw:
+        raw = meta_kw.get("content", "").strip()
+        if raw:
+            return _clean_keywords(raw)
 
-    # ── Strategy A: heading/label → sibling content (NOT location) ────────
-    # Handles brownbook "Business tags" heading + "Location tags" heading pattern.
-    # We find a "Business tags" heading, then read its sibling/child content
-    # while stopping before any "Location tags" sibling.
+    # ── Strategy A: "Business tags" heading → walk NEXT siblings only ─────────
+    #
+    # brownbook layout (simplified):
+    #   <div class="tags-wrapper">
+    #     <div class="col">
+    #       <h3>Business tags</h3>          ← we find this
+    #       <a>Water Damage …</a>
+    #     </div>
+    #     <div class="col">
+    #       <h3>Location tags</h3>          ← we STOP before this
+    #       <a>Nokomis</a><a>Florida</a>
+    #     </div>
+    #   </div>
+    #
+    # Fix: walk NEXT SIBLINGS of the heading (not its parent's all-children).
+    # Parent-container fallback kept but now skips location sub-trees.
+
     for label_tag in soup.find_all(
         ["h2", "h3", "h4", "h5", "strong", "b", "p", "div", "span", "td", "th"]
     ):
         label_txt = label_tag.get_text(strip=True)
+
         if not _BIZ_TAG_RE.search(label_txt):
             continue
-        # Skip "Location tags" headings
-        if _LOC_TAG_RE.search(label_txt):
+        if _LOC_TAG_RE.search(label_txt):          # skip "Location tags" headings
             continue
-        # Skip nav/footer containers
         if _container_is_nav(label_tag):
             continue
 
-        # Check if siblings of the heading's parent contain the tags
+        # --- Walk NEXT siblings of the heading (primary path) -----------------
+        collected = []
+        for sib in label_tag.find_next_siblings():
+            if not hasattr(sib, "get_text"):
+                continue
+            sib_txt = sib.get_text(strip=True)
+            if not sib_txt:
+                continue
+            if _is_location_container(sib):        # stop at location section
+                break
+            if hasattr(sib, "name") and sib.name in ("h2", "h3", "h4"):
+                if not _BIZ_TAG_RE.search(sib_txt):
+                    break
+            items = _collect_tag_items(sib, exclude_location_subtrees=True)
+            if items:
+                collected.extend(items)
+                break  # consume only the first non-empty content sibling
+
+        if collected:
+            result = _clean_keywords(", ".join(collected))
+            if result:
+                return result
+
+        # --- Parent-container fallback (skip location sub-trees) --------------
         parent = label_tag.parent
         if parent and hasattr(parent, "get"):
             if not _is_location_container(parent):
-                items = _collect_tag_items(parent)
-                # Remove the label text itself from results
+                items = _collect_tag_items(parent, exclude_location_subtrees=True)
                 items = [i for i in items if i.lower() != label_txt.lower()]
                 if items:
                     result = _clean_keywords(", ".join(items))
                     if result:
                         return result
 
-        # Follow next siblings — stop at location-tag sibling
-        for sib in label_tag.find_next_siblings():
-            sib_txt = sib.get_text(strip=True) if hasattr(sib, "get_text") else ""
-            if not sib_txt:
-                continue
-            # Stop if we've reached a "Location tags" section
-            if _is_location_container(sib):
-                break
-            # Stop if next unrelated heading
-            if hasattr(sib, "name") and sib.name in ("h2", "h3", "h4"):
-                if not _BIZ_TAG_RE.search(sib_txt):
-                    break
-            items = _collect_tag_items(sib)
-            if items:
-                result = _clean_keywords(", ".join(items))
-                if result:
-                    return result
-            break  # only consume first non-empty sibling
-
-    # ── Strategy B: containers with tag/keyword class/id ──────────────────
+    # ── Strategy B: containers with tag/keyword class/id ──────────────────────
     _TAG_CLS_RE = re.compile(
         r"\b(business[-_]?tags?|listing[-_]?tags?|tags?[-_]?list|"
         r"keywords?[-_]?list|tag[-_]?container|tag[-_]?cloud|chips?|"
@@ -842,41 +906,78 @@ def _universal_keywords(soup) -> str:
             continue
         if _is_hidden(container):
             continue
-        items = _collect_tag_items(container)
+        items = _collect_tag_items(container, exclude_location_subtrees=True)
         if items:
             result = _clean_keywords(", ".join(items))
             if result:
                 return result
 
-    # ── Strategy C: "Tags:" / "Keywords:" label in plain text ─────────────
+    # ── Strategy C: plain-text colon and next-line patterns ───────────────────
+    #
+    # Handles freelistingusa "Tags: Water Damage Restoration Service" (same line)
+    # and two-line FAQ-block "Tags\nWater Damage Restoration Service".
+
     full_text = soup.get_text(separator="\n", strip=True)
+
+    # Same-line colon: "Tags: foo, bar"  or  "Business tags: foo"
     for pattern in [
-        r"(?:^|\n)\s*business\s+tags?\s*:?\s*\n([^\n]{3,200})",
-        r"(?:^|\n)\s*tags?\s*:?\s*\n([^\n]{3,200})",
-        r"(?:^|\n)\s*keywords?\s*:?\s*\n([^\n]{3,200})",
+        r"(?:^|[\n\r])\s*(?:business\s+)?tags?\s*:\s*([^\n\r]{3,300})",
+        r"(?:^|[\n\r])\s*keywords?\s*:\s*([^\n\r]{3,300})",
     ]:
         m = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
         if m:
             raw = m.group(1).strip()
-            # Split only on non-space separators to preserve multi-word tags
             parts = [p.strip() for p in re.split(r"[,|;.]", raw) if p.strip()]
             cleaned = _clean_keywords(", ".join(parts))
             if cleaned:
                 return cleaned
 
-    # ── Strategy D: DOM label element → next sibling ──────────────────────
+    # Next-line: label on line N, values on line N+1
+    for pattern in [
+        r"(?:^|[\n\r])\s*(?:business\s+)?tags?\s*[\n\r]+\s*([^\n\r]{3,300})",
+        r"(?:^|[\n\r])\s*keywords?\s*[\n\r]+\s*([^\n\r]{3,300})",
+    ]:
+        m = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            raw = m.group(1).strip()
+            if len(raw.split()) > 20:      # skip if it looks like a paragraph
+                continue
+            parts = [p.strip() for p in re.split(r"[,|;.]", raw) if p.strip()]
+            cleaned = _clean_keywords(", ".join(parts))
+            if cleaned:
+                return cleaned
+
+    # ── Strategy D: DOM label element → next sibling (relaxed matching) ───────
+    #
+    # Original required element text == exactly "Tags" (strict `^(tags?)$`).
+    # New: also matches when element text STARTS WITH "Tags" (e.g. "Tags:").
+
+    _LABEL_STRICT_RE = re.compile(
+        r"^(tags?|business\s+tags?|keywords?)\s*:?\s*$",
+        re.IGNORECASE,
+    )
+    _LABEL_STARTS_RE = re.compile(
+        r"^(tags?|business\s+tags?|keywords?)\b",
+        re.IGNORECASE,
+    )
+
     for tag in soup.find_all(["h2", "h3", "h4", "strong", "b", "p", "div", "span"]):
         txt = tag.get_text(strip=True)
-        if not re.match(r"^(tags?|business\s+tags?|keywords?)\s*:?\s*$", txt, re.IGNORECASE):
+        if not (_LABEL_STRICT_RE.match(txt) or _LABEL_STARTS_RE.match(txt)):
+            continue
+        if _LOC_TAG_RE.search(txt):
+            continue
+        if _container_is_nav(tag):
             continue
         for sib in tag.find_next_siblings():
             sib_txt = sib.get_text(strip=True) if hasattr(sib, "get_text") else ""
             if not sib_txt or _is_location_container(sib):
                 continue
             if len(sib_txt) < 300:
-                items = _collect_tag_items(sib)
+                items = _collect_tag_items(sib, exclude_location_subtrees=True)
                 if not items:
-                    items = [p.strip() for p in re.split(r"[,|;.]", sib_txt) if p.strip()]
+                    items = [p.strip() for p in re.split(r"[,|;.]", sib_txt)
+                             if p.strip()]
                 if items:
                     cleaned = _clean_keywords(", ".join(items))
                     if cleaned:
