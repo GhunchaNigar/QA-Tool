@@ -392,53 +392,183 @@ def _longest_good_para(soup) -> str:
     return best
 
 
+# Patterns that indicate a text is NOT a real description —
+# used to reject false positives from hotfrog breadcrumb/title strings
+_FALSE_DESC_RE = re.compile(
+    r"^[^.]{0,80}Category\s*:\s*[^.]{0,80}$"   # "Name Category: Something" one-liner
+    r"|^\s*\w[\w\s&,\-\.]+\s+Category\s*:\s*[\w\s&,\-]+$",  # same pattern
+    re.IGNORECASE,
+)
+
+# Signals that a container holds navigation/UI text, not a real description
+_NAV_CONTAINER_RE = re.compile(
+    r"\b(breadcrumb|nav|menu|footer|header|sidebar|widget|"
+    r"related|recommend|sponsored|ad[-_]|[-_]ad\b)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_false_description(text: str) -> bool:
+    """
+    Returns True when the text looks like a breadcrumb, title, or
+    category string rather than genuine descriptive prose.
+    Examples to reject:
+      "WrightWay Emergency Services Category: Fire & Water Damage Repair Cleaning"
+      "Focal | Business Organizations"
+    """
+    if not text:
+        return True
+    # Very short + contains "Category:"
+    if re.search(r"\bCategory\s*:", text, re.IGNORECASE) and len(text) < 200:
+        return True
+    # Pipe-separated navigation fragments (no sentence structure)
+    if text.count("|") >= 2 and len(text) < 200:
+        return True
+    # No sentence-ending punctuation and fewer than 15 words → likely a title
+    word_count = len(text.split())
+    has_sentence = bool(re.search(r"[.!?]", text))
+    if word_count < 12 and not has_sentence:
+        return True
+    return False
+
+
+def _container_is_nav(tag) -> bool:
+    """Return True if the tag or any close ancestor looks like a nav/UI container."""
+    cls = _cls_str(tag)
+    if _NAV_CONTAINER_RE.search(cls):
+        return True
+    parent = tag.parent
+    if parent and hasattr(parent, "get"):
+        if _NAV_CONTAINER_RE.search(_cls_str(parent)):
+            return True
+    return False
+
+
 def _universal_description(soup, structured_desc: str) -> str:
     """
     Find the best description text using universal DOM heuristics.
-    Tries multiple strategies in order of confidence.
-    """
-    # Strategy 1: Already have good structured data description
-    if _good_desc(structured_desc) and len(structured_desc) >= 100:
-        return structured_desc
 
-    # Strategy 2: Heading sibling paragraphs ("About", "More about", "Overview", etc.)
-    about_re = re.compile(r"\b(about|more\s+about|overview|description|who\s+we\s+are|our\s+story)\b", re.IGNORECASE)
-    for h in soup.find_all(["h1", "h2", "h3", "h4", "strong", "b"]):
-        if about_re.search(h.get_text(strip=True)):
+    Priority order:
+      1. Structured data (JSON-LD / microdata) if long enough and not a false match
+      2. "More about …" / "About" heading siblings — the full bottom-of-page section
+         that directories render to avoid "See More" truncation
+      3. Sibling paragraphs of any about/description heading
+      4. Elements with description/about/overview class or id
+      5. Longest good <p> tag anywhere on the page (scan bottom-up first so we
+         pick up the full untruncated version before the clipped top snippet)
+      6. Fall back to structured_desc even if short
+    """
+
+    # Helper: pick the better of two candidate strings
+    def _better(a: str, b: str) -> str:
+        """Return whichever is longer and passes _good_desc; prefer b if both good."""
+        a_ok = _good_desc(a) and not _is_false_description(a)
+        b_ok = _good_desc(b) and not _is_false_description(b)
+        if a_ok and b_ok:
+            return b if len(b) >= len(a) else a
+        if b_ok:
+            return b
+        if a_ok:
+            return a
+        return ""
+
+    best = ""
+
+    # ── Strategy 1: Structured data ──────────────────────────────────────────
+    if structured_desc and _good_desc(structured_desc) and not _is_false_description(structured_desc):
+        if len(structured_desc) >= 150:
+            # Long structured description is usually reliable — still keep looking
+            # for a longer version from the DOM
+            best = structured_desc
+
+    # ── Strategy 2: "More about …" / full bottom-of-page section ─────────────
+    # Directories like nearfinderus render the COMPLETE description in a section
+    # titled "More about BUSINESS in City" near the bottom of the page, while the
+    # top of the page shows a truncated "See More" snippet.
+    more_about_re = re.compile(r"\bmore\s+about\b", re.IGNORECASE)
+    for h in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
+        if not more_about_re.search(h.get_text(strip=True)):
+            continue
+        # Try container of the heading first (may hold multiple paragraphs)
+        container = h.parent
+        if container:
+            combined = " ".join(
+                p.get_text(separator=" ", strip=True)
+                for p in container.find_all("p")
+                if not _is_hidden(p)
+            ).strip()
+            if combined and len(combined) > 50:
+                best = _better(best, combined)
+                if len(best) >= 200:
+                    break
+        # Also try heading's next siblings
+        for sib in h.find_next_siblings(["p", "div", "section"]):
+            if _is_hidden(sib):
+                continue
+            text = sib.get_text(separator=" ", strip=True)
+            if _good_desc(text) and not _is_false_description(text):
+                best = _better(best, text)
+                break
+
+    # ── Strategy 3: Any about/description heading → sibling paragraphs ───────
+    if not best or len(best) < 150:
+        about_re = re.compile(
+            r"\b(about(\s+us)?|overview|description|who\s+we\s+are|our\s+story|"
+            r"company\s+info|business\s+info)\b",
+            re.IGNORECASE,
+        )
+        for h in soup.find_all(["h1", "h2", "h3", "h4", "strong", "b"]):
+            htxt = h.get_text(strip=True)
+            if not about_re.search(htxt):
+                continue
+            if _container_is_nav(h):
+                continue
             for sib in h.find_next_siblings(["p", "div", "section"]):
                 if _is_hidden(sib):
                     continue
                 text = sib.get_text(separator=" ", strip=True)
-                if _good_desc(text):
-                    # Prefer longer version if structured is short
-                    if len(text) > len(structured_desc):
-                        return text
+                if _good_desc(text) and not _is_false_description(text):
+                    best = _better(best, text)
                     break
 
-    # Strategy 3: Elements with description/about/overview class or id
-    desc_re = re.compile(r"\b(description|about|overview|summary|bio|info[-_]?text|company[-_]?info)\b", re.IGNORECASE)
-    for tag in soup.find_all(["div", "section", "article", "p"]):
-        if desc_re.search(_cls_str(tag)):
-            if _is_hidden(tag):
+    # ── Strategy 4: Elements with description/about/overview class or id ──────
+    if not best or len(best) < 150:
+        desc_cls_re = re.compile(
+            r"\b(description|about|overview|summary|bio|info[-_]?text|"
+            r"company[-_]?info|business[-_]?info|listing[-_]?desc)\b",
+            re.IGNORECASE,
+        )
+        for tag in soup.find_all(["div", "section", "article", "p"]):
+            if _is_hidden(tag) or _container_is_nav(tag):
+                continue
+            if not desc_cls_re.search(_cls_str(tag)):
                 continue
             text = tag.get_text(separator=" ", strip=True)
-            if _good_desc(text) and len(text) > len(structured_desc):
-                return text
+            if _good_desc(text) and not _is_false_description(text):
+                best = _better(best, text)
 
-    # Strategy 4: Bottom-of-page "More about X in City" sections (nearfinderus style)
-    # Scan all paragraphs from bottom up for a rich description
-    all_paras = soup.find_all("p")
-    for p in reversed(all_paras):
-        if _is_hidden(p):
-            continue
-        text = p.get_text(separator=" ", strip=True)
-        if _good_desc(text) and len(text) > max(len(structured_desc), 100):
-            return text
+    # ── Strategy 5: Scan all <p> tags bottom-up for the longest good one ──────
+    # Scanning bottom-up finds the full untruncated version (which directories
+    # render at the bottom) before the visually-clamped top snippet.
+    if not best or len(best) < 150:
+        all_paras = soup.find_all("p")
+        for p in reversed(all_paras):
+            if _is_hidden(p) or _container_is_nav(p):
+                continue
+            text = p.get_text(separator=" ", strip=True)
+            if _good_desc(text) and not _is_false_description(text):
+                best = _better(best, text)
+                # Once we have a solid long candidate stop scanning
+                if len(best) >= 300:
+                    break
 
-    # Strategy 5: Fall back to structured data even if short, or longest good para
-    if structured_desc:
-        return structured_desc
-    return _longest_good_para(soup)
+    # ── Strategy 6: Fall back ─────────────────────────────────────────────────
+    if not best:
+        if structured_desc and _good_desc(structured_desc):
+            return structured_desc
+        return _longest_good_para(soup)
+
+    return best
 
 
 def _universal_website(soup) -> str:
@@ -512,58 +642,120 @@ def _universal_social(soup) -> str:
 
 
 def _universal_hours(soup, structured_hours: str) -> str:
-    """Find business hours using universal patterns."""
-    if structured_hours:
-        # Validate: reject placeholder-only hours
-        if not re.search(r"0{1,2}:0{2}\s*(?:to|-|–)\s*0{1,2}:0{2}", structured_hours):
-            return structured_hours
+    """
+    Find business hours using universal patterns.
 
-    hours_container_re = re.compile(
-        r"(hours|schedule|working[-_]?hours|business[-_]?hours|opening[-_]?hours|open)",
-        re.IGNORECASE,
+    Handles:
+    - JSON-LD / itemprop structured hours (passed in as structured_hours)
+    - nearfinderus "00:00 to 00:00" JS placeholders → rejected
+    - hotfrog opening-hours table with day + time rows
+    - Any container/element with day names + real time values
+    """
+    _PLACEHOLDER_RE = re.compile(
+        r"0{1,2}:0{2}\s*(?:to|-|–|–)\s*0{1,2}:0{2}", re.IGNORECASE
     )
-    day_re = re.compile(
+    _DAY_RE = re.compile(
         r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
         r"mon|tue|wed|thu|fri|sat|sun)\b",
         re.IGNORECASE,
     )
-    time_re = re.compile(r"\d{1,2}:\d{2}|\b(am|pm|open|closed|24)\b", re.IGNORECASE)
+    _TIME_RE = re.compile(
+        r"\d{1,2}:\d{2}|\b(am|pm|open|closed|24\s*hours?)\b", re.IGNORECASE
+    )
+    _HOURS_CONTAINER_RE = re.compile(
+        r"\b(hours|schedule|working[-_]?hours|business[-_]?hours|"
+        r"opening[-_]?hours|open[-_]?time|timetable)\b",
+        re.IGNORECASE,
+    )
 
-    # Look for containers with hours-related class/id
-    for tag in soup.find_all(["div", "section", "table", "ul"]):
-        if not hours_container_re.search(_cls_str(tag)):
+    def _is_placeholder_only(text: str) -> bool:
+        """True when every time value in the string is a 00:00 placeholder."""
+        real_times = re.findall(r"\d{1,2}:\d{2}", text)
+        if not real_times:
+            return False
+        return all(re.match(r"^0{1,2}:0{2}$", t) for t in real_times)
+
+    def _hours_valid(text: str) -> bool:
+        """Return True when text looks like real hours (not review/phone/placeholder)."""
+        if not text or len(text) > 700:
+            return False
+        if _PHONE_IN_TEXT.search(text):
+            return False
+        if re.search(r"\breview\b", text, re.IGNORECASE) and not _TIME_RE.search(text):
+            return False
+        if _is_placeholder_only(text):
+            return False
+        # Count placeholders vs day mentions
+        placeholder_count = len(_PLACEHOLDER_RE.findall(text))
+        day_count = len(_DAY_RE.findall(text))
+        if day_count > 0 and placeholder_count >= day_count:
+            return False
+        # Must have at least one day AND one time signal
+        return bool(_DAY_RE.search(text) and _TIME_RE.search(text))
+
+    # ── Step 1: Structured hours from JSON-LD / itemprop ─────────────────────
+    if structured_hours and not _is_placeholder_only(structured_hours):
+        if _hours_valid(structured_hours) or re.search(r"\b(open|closed|24)\b", structured_hours, re.IGNORECASE):
+            return structured_hours
+
+    # ── Step 2: itemprop="openingHours" content attribute ────────────────────
+    oh_tags = soup.find_all(attrs={"itemprop": "openingHours"})
+    if oh_tags:
+        hrs = []
+        for t in oh_tags:
+            val = (t.get("content", "") or t.get_text(strip=True)).strip()
+            if val and not _is_placeholder_only(val):
+                hrs.append(val)
+        if hrs:
+            candidate = "; ".join(hrs)
+            if not _is_placeholder_only(candidate):
+                return candidate
+
+    # ── Step 3: Table rows inside an hours container ──────────────────────────
+    # hotfrog renders hours as a 2-column table (Day | Time range)
+    for table in soup.find_all("table"):
+        cls = _cls_str(table)
+        parent_cls = _cls_str(table.parent) if table.parent and hasattr(table.parent, "get") else ""
+        if not (_HOURS_CONTAINER_RE.search(cls) or _HOURS_CONTAINER_RE.search(parent_cls)):
             continue
-        if re.search(r"\baddress\b|\bcontact\b|\bphone\b", _cls_str(tag)):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        row_parts = []
+        for row in rows:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if len(cells) < 2:
+                continue
+            day_part  = cells[0].strip()
+            time_part = cells[1].strip()
+            if not _DAY_RE.search(day_part):
+                continue
+            if _is_placeholder_only(time_part) or not time_part:
+                continue
+            row_parts.append(f"{day_part}: {time_part}")
+        if row_parts:
+            return "; ".join(row_parts)
+
+    # ── Step 4: Div/section containers with hours class/id ───────────────────
+    for tag in soup.find_all(["div", "section", "ul", "dl"]):
+        cls = _cls_str(tag)
+        if not _HOURS_CONTAINER_RE.search(cls):
+            continue
+        if re.search(r"\b(address|contact|phone|map)\b", cls):
+            continue
+        if _is_hidden(tag):
             continue
         text = tag.get_text(separator=" ", strip=True)
-        if not text or len(text) > 600:
-            continue
-        if _PHONE_IN_TEXT.search(text):
-            continue
-        if re.search(r"\breview\b", text, re.IGNORECASE) and not time_re.search(text):
-            continue
-        # Must have actual time info
-        if day_re.search(text) and time_re.search(text):
+        if _hours_valid(text):
             return text
 
-    # Scan any element with day names + time info
-    for tag in soup.find_all(["p", "div", "li", "span", "td"]):
+    # ── Step 5: Any element with day + time pattern ───────────────────────────
+    for tag in soup.find_all(["p", "div", "li", "span", "td", "dd"]):
+        if _is_hidden(tag):
+            continue
         text = tag.get_text(separator=" ", strip=True)
-        if not text or len(text) > 300 or _is_hidden(tag):
-            continue
-        if not day_re.search(text):
-            continue
-        if not time_re.search(text):
-            continue
-        if _PHONE_IN_TEXT.search(text):
-            continue
-        if re.search(r"\breview\b", text, re.IGNORECASE):
-            continue
-        placeholder_count = len(re.findall(r"0{1,2}:0{2}\s*(?:to|-|–)\s*0{1,2}:0{2}", text))
-        day_count = len(day_re.findall(text))
-        if placeholder_count > 0 and placeholder_count >= day_count:
-            continue
-        return text
+        if _hours_valid(text) and len(text) < 400:
+            return text
 
     return ""
 
@@ -1051,17 +1243,23 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
             )
         elif f == "Description":
             field_rules.append(
-                '- "Description": the business\'s own descriptive text.\n'
+                '- "Description": the business\'s own descriptive prose.\n'
                 '  Use DESCRIPTION from PRE-EXTRACTED FIELDS verbatim if present.\n'
-                '  Otherwise find prose paragraphs describing what the business does.\n'
-                '  NEVER return an address, phone number, or navigation text.\n'
-                '  Return null only if genuinely absent.'
+                '  Otherwise find multi-sentence paragraphs describing what the business does —\n'
+                '  look especially in "More about …" sections at the bottom of the page.\n'
+                '  NEVER return: addresses, phone numbers, navigation breadcrumbs,\n'
+                '  category labels (e.g. "BusinessName Category: Fire & Water Damage Repair"),\n'
+                '  page titles, or single-line classification strings.\n'
+                '  A valid description is at least 2 sentences of genuine business prose.\n'
+                '  Return null only if no such prose exists on the page.'
             )
         elif f == "Hours":
             field_rules.append(
                 '- "Hours": operating hours.\n'
                 '  Use HOURS from PRE-EXTRACTED FIELDS if present.\n'
-                '  NEVER return hours where every day shows "00:00 to 00:00" — return null.\n'
+                '  Look for a table or list showing day names and times (e.g. "Monday 9am-5pm").\n'
+                '  NEVER return hours where every time value is "00:00" — those are\n'
+                '  unrendered JS placeholders; return null instead.\n'
                 '  NEVER return an address, phone number, or review text as hours.'
             )
         elif f == "Social Media Links":
@@ -1258,22 +1456,32 @@ def extract_fields(
         if "Hours" in fields:
             hours_val = extracted.get("Hours", "") or ""
             if hours_val:
+                _ph_re = re.compile(r"0{1,2}:0{2}\s*(?:to|-|–)\s*0{1,2}:0{2}", re.IGNORECASE)
+                real_times = re.findall(r"\d{1,2}:\d{2}", hours_val)
+                placeholder_times = _ph_re.findall(hours_val)
                 if _PHONE_IN_TEXT.search(hours_val):
                     extracted["Hours"] = None
                 elif re.search(r"\breview\b", hours_val, re.IGNORECASE) and not re.search(r"\d{1,2}:\d{2}", hours_val):
                     extracted["Hours"] = None
-                else:
-                    real_segs = len(re.findall(r"\d{1,2}:\d{2}", hours_val))
-                    placeholder_segs = len(re.findall(r"0{1,2}:0{2}\s*(?:to|-|–)\s*0{1,2}:0{2}", hours_val))
-                    if real_segs > 0 and placeholder_segs == real_segs:
-                        extracted["Hours"] = None
+                elif real_times and all(re.match(r"^0{1,2}:0{2}$", t) for t in real_times):
+                    # Every time value is 00:00 — all placeholder, nullify
+                    extracted["Hours"] = None
+                    # Try to rescue from hints
+                    if hints.get("hours"):
+                        extracted["Hours"] = hints["hours"]
+                elif len(placeholder_times) > 0 and len(placeholder_times) >= len(real_times):
+                    extracted["Hours"] = None
 
-        # Description: reject bad descriptions
+        # Description: reject false descriptions (breadcrumbs, category strings, etc.)
         if "Description" in fields:
             desc_val = extracted.get("Description", "") or ""
-            if desc_val and not _good_desc(desc_val):
-                hint_desc = hints.get("description", "")
-                extracted["Description"] = hint_desc if _good_desc(hint_desc) else None
+            if desc_val:
+                if not _good_desc(desc_val) or _is_false_description(desc_val):
+                    hint_desc = hints.get("description", "")
+                    extracted["Description"] = (
+                        hint_desc if (_good_desc(hint_desc) and not _is_false_description(hint_desc))
+                        else None
+                    )
 
         # Keywords: clean whatever remains
         if "Keywords" in fields:
