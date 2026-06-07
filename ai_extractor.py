@@ -1343,6 +1343,7 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
         ("social",      "SOCIAL MEDIA LINKS"),
         ("gbp",         "GBP LINK"),
         ("category",    "CATEGORY"),
+        ("keywords",    "KEYWORDS (use these verbatim)"),
     ]
     for hint_key, label in field_hint_map:
         val = hints.get(hint_key, "")
@@ -1469,7 +1470,7 @@ CRITICAL RULES:
 - Logo/Photos: if PRE-EXTRACTED confirms PRESENT, return "PRESENT" — do not second-guess.
 - Website URL: NEVER return a cloudflare.com URL.
 - Hours: NEVER return "00:00 to 00:00" placeholders — return null instead.
-- Keywords: search the entire page for "Business tags", "Tags", "Keywords" sections or pipe/comma-separated labels. Return comma-separated.
+- Keywords: use KEYWORDS from PRE-EXTRACTED FIELDS verbatim if present. Otherwise search the page for "Tags", "Keywords", or pipe/comma-separated label sections and return comma-separated.
 - Name: NEVER return a website domain (e.g. "nearfinderus.com") as the business name.
 
 FIELD INSTRUCTIONS:
@@ -1608,6 +1609,12 @@ def extract_fields(
             if hints.get(hint_key) and field_name in fields:
                 if _empty(extracted.get(field_name)):
                     extracted[field_name] = hints[hint_key]
+
+        # Keywords: use pre-extracted hint as fallback if Gemini returned empty
+        if "Keywords" in fields:
+            kw_hint = hints.get("keywords", "")
+            if _empty(extracted.get("Keywords")) and kw_hint:
+                extracted["Keywords"] = _clean_keywords(kw_hint) or None
 
         # ── Final guards ───────────────────────────────────────────────────
 
