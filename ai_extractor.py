@@ -1406,10 +1406,10 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
             field_rules.append('- "Category": business type or industry. Use PRE-EXTRACTED if present.')
         elif f == "Keywords":
             field_rules.append(
-                '- "Keywords": ONLY use the KEYWORDS value from PRE-EXTRACTED FIELDS.\n'
-                '  If no KEYWORDS appears in PRE-EXTRACTED FIELDS, return null.\n'
-                '  NEVER infer keywords from page text, description, title, or category.\n'
-                '  NEVER include addresses, zip codes, city/state names, or road types.'
+                '- "Keywords": any tags, keywords, or labels associated with the business. '
+                'These may appear as pipe-separated values (e.g. "AI | Legal | Law"), '
+                'comma-separated tags, or a labeled section like "Keywords" or "Tags". '
+                'Return comma-separated.'
             )
         elif f == "Description":
             field_rules.append(
