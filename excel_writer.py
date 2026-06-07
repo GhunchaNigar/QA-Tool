@@ -47,9 +47,7 @@ def make_filename(business_name: str) -> str:
     name = (business_name or "").strip()
     if not name:
         return "listing_checker_report.xlsx"
-    # Replace any character that isn't alphanumeric, space, hyphen, or dot with nothing
     safe = re.sub(r"[^\w\s\-]", "", name)
-    # Replace whitespace runs with a single underscore
     safe = re.sub(r"\s+", "_", safe).strip("_")
     return f"{safe}_listing_report.xlsx" if safe else "listing_checker_report.xlsx"
 
@@ -65,12 +63,6 @@ def write_excel(results: list) -> bytes:
     """
     Build a multi-source Excel report.
     Columns: Source | Live Link | Status | <all ALL_FIELDS>
-
-    Args:
-        results: list of comparison dicts from comparator.compare_all()
-
-    Returns:
-        Raw bytes of the .xlsx file.
     """
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -92,6 +84,9 @@ def write_excel(results: list) -> bytes:
             _style_cell(cell,
                 fill=FILL_HEADER, font=FONT_HEADER,
                 alignment=ALIGN_CENTER, border=BORDER_THIN)
+
+    # Fix header row height so wrapped multi-word headers never get clipped
+    ws.row_dimensions[1].height = 30
 
     # ── Data rows ─────────────────────────────────────────────────────────────
     for result in results:
@@ -124,9 +119,15 @@ def write_excel(results: list) -> bytes:
                     font=FONT_NORMAL, alignment=ALIGN_LEFT, border=BORDER_THIN)
 
     # ── Column widths ─────────────────────────────────────────────────────────
-    col_widths = {"Source": 22, "Live Link": 45, "Status": 14}
+    # Explicit overrides for fixed columns
+    explicit_widths = {"Source": 22, "Live Link": 45, "Status": 14}
     for col_idx, header in enumerate(headers, start=1):
-        width = col_widths.get(header, 16)
+        if header in explicit_widths:
+            width = explicit_widths[header]
+        else:
+            # Auto-size: wide enough to show the header on one line (+ 4 padding)
+            # so headers are never clipped regardless of content
+            width = max(len(header) + 4, 16)
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     ws.freeze_panes = "A2"
