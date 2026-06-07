@@ -6,6 +6,13 @@ Extracts business fields from any directory listing page using:
   3. Gemini AI — fills gaps and resolves ambiguity
 
 No per-domain code paths. Every extractor rule applies to every URL.
+
+Fixes applied:
+  - Cloudflare 522 / connection error pages now detected and short-circuited
+  - Keywords: pipe-split bug fixed (multi-word tags like "ChatGPT Ads" preserved)
+  - Keywords: "Location tags" sibling containers excluded from keyword collection
+  - Keywords: "Business tags" containers explicitly targeted
+  - Post-processing: Name values that look like domain names are nullified
 """
 
 import json
@@ -84,6 +91,12 @@ _BAD_DESC_PHRASES = (
     "opening hours", "phone number", "get directions",
     "claim this", "report an error", "edit this",
     "add to favorites", "share this", "follow us",
+)
+
+# Regex to detect domain-like names (e.g. "nearfinderus.com")
+_DOMAIN_NAME_RE = re.compile(
+    r"\.(com|net|org|io|co|us|info|biz|gov|edu)\b",
+    re.IGNORECASE,
 )
 
 
@@ -188,7 +201,6 @@ def _ld_find(blocks: list, *types_) -> dict:
             bt = " ".join(bt)
         if any(t in bt.lower() for t in type_lower):
             return block
-    # Fallback: return first block with any @type
     for block in blocks:
         if block.get("@type"):
             return block
@@ -355,7 +367,6 @@ def _extract_structured(soup) -> dict:
                 out["hours"] = "; ".join(hrs)
 
     # ── Meta tags ──
-    # og:image as logo/photo hint
     og_img = (soup.find("meta", property="og:image") or
                soup.find("meta", attrs={"name": "og:image"}))
     if og_img:
@@ -366,7 +377,6 @@ def _extract_structured(soup) -> dict:
             if content not in out["image_urls"]:
                 out["image_urls"].append(content)
 
-    # Meta description as fallback
     if not out["description"]:
         meta_desc = soup.find("meta", attrs={"name": "description"})
         if meta_desc:
@@ -392,15 +402,12 @@ def _longest_good_para(soup) -> str:
     return best
 
 
-# Patterns that indicate a text is NOT a real description —
-# used to reject false positives from hotfrog breadcrumb/title strings
 _FALSE_DESC_RE = re.compile(
-    r"^[^.]{0,80}Category\s*:\s*[^.]{0,80}$"   # "Name Category: Something" one-liner
-    r"|^\s*\w[\w\s&,\-\.]+\s+Category\s*:\s*[\w\s&,\-]+$",  # same pattern
+    r"^[^.]{0,80}Category\s*:\s*[^.]{0,80}$"
+    r"|^\s*\w[\w\s&,\-\.]+\s+Category\s*:\s*[\w\s&,\-]+$",
     re.IGNORECASE,
 )
 
-# Signals that a container holds navigation/UI text, not a real description
 _NAV_CONTAINER_RE = re.compile(
     r"\b(breadcrumb|nav|menu|footer|header|sidebar|widget|"
     r"related|recommend|sponsored|ad[-_]|[-_]ad\b)\b",
@@ -409,22 +416,12 @@ _NAV_CONTAINER_RE = re.compile(
 
 
 def _is_false_description(text: str) -> bool:
-    """
-    Returns True when the text looks like a breadcrumb, title, or
-    category string rather than genuine descriptive prose.
-    Examples to reject:
-      "WrightWay Emergency Services Category: Fire & Water Damage Repair Cleaning"
-      "Focal | Business Organizations"
-    """
     if not text:
         return True
-    # Very short + contains "Category:"
     if re.search(r"\bCategory\s*:", text, re.IGNORECASE) and len(text) < 200:
         return True
-    # Pipe-separated navigation fragments (no sentence structure)
     if text.count("|") >= 2 and len(text) < 200:
         return True
-    # No sentence-ending punctuation and fewer than 15 words → likely a title
     word_count = len(text.split())
     has_sentence = bool(re.search(r"[.!?]", text))
     if word_count < 12 and not has_sentence:
@@ -433,7 +430,6 @@ def _is_false_description(text: str) -> bool:
 
 
 def _container_is_nav(tag) -> bool:
-    """Return True if the tag or any close ancestor looks like a nav/UI container."""
     cls = _cls_str(tag)
     if _NAV_CONTAINER_RE.search(cls):
         return True
@@ -445,23 +441,7 @@ def _container_is_nav(tag) -> bool:
 
 
 def _universal_description(soup, structured_desc: str) -> str:
-    """
-    Find the best description text using universal DOM heuristics.
-
-    Priority order:
-      1. Structured data (JSON-LD / microdata) if long enough and not a false match
-      2. "More about …" / "About" heading siblings — the full bottom-of-page section
-         that directories render to avoid "See More" truncation
-      3. Sibling paragraphs of any about/description heading
-      4. Elements with description/about/overview class or id
-      5. Longest good <p> tag anywhere on the page (scan bottom-up first so we
-         pick up the full untruncated version before the clipped top snippet)
-      6. Fall back to structured_desc even if short
-    """
-
-    # Helper: pick the better of two candidate strings
     def _better(a: str, b: str) -> str:
-        """Return whichever is longer and passes _good_desc; prefer b if both good."""
         a_ok = _good_desc(a) and not _is_false_description(a)
         b_ok = _good_desc(b) and not _is_false_description(b)
         if a_ok and b_ok:
@@ -474,22 +454,14 @@ def _universal_description(soup, structured_desc: str) -> str:
 
     best = ""
 
-    # ── Strategy 1: Structured data ──────────────────────────────────────────
     if structured_desc and _good_desc(structured_desc) and not _is_false_description(structured_desc):
         if len(structured_desc) >= 150:
-            # Long structured description is usually reliable — still keep looking
-            # for a longer version from the DOM
             best = structured_desc
 
-    # ── Strategy 2: "More about …" / full bottom-of-page section ─────────────
-    # Directories like nearfinderus render the COMPLETE description in a section
-    # titled "More about BUSINESS in City" near the bottom of the page, while the
-    # top of the page shows a truncated "See More" snippet.
     more_about_re = re.compile(r"\bmore\s+about\b", re.IGNORECASE)
     for h in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
         if not more_about_re.search(h.get_text(strip=True)):
             continue
-        # Try container of the heading first (may hold multiple paragraphs)
         container = h.parent
         if container:
             combined = " ".join(
@@ -501,7 +473,6 @@ def _universal_description(soup, structured_desc: str) -> str:
                 best = _better(best, combined)
                 if len(best) >= 200:
                     break
-        # Also try heading's next siblings
         for sib in h.find_next_siblings(["p", "div", "section"]):
             if _is_hidden(sib):
                 continue
@@ -510,7 +481,6 @@ def _universal_description(soup, structured_desc: str) -> str:
                 best = _better(best, text)
                 break
 
-    # ── Strategy 3: Any about/description heading → sibling paragraphs ───────
     if not best or len(best) < 150:
         about_re = re.compile(
             r"\b(about(\s+us)?|overview|description|who\s+we\s+are|our\s+story|"
@@ -531,7 +501,6 @@ def _universal_description(soup, structured_desc: str) -> str:
                     best = _better(best, text)
                     break
 
-    # ── Strategy 4: Elements with description/about/overview class or id ──────
     if not best or len(best) < 150:
         desc_cls_re = re.compile(
             r"\b(description|about|overview|summary|bio|info[-_]?text|"
@@ -547,9 +516,6 @@ def _universal_description(soup, structured_desc: str) -> str:
             if _good_desc(text) and not _is_false_description(text):
                 best = _better(best, text)
 
-    # ── Strategy 5: Scan all <p> tags bottom-up for the longest good one ──────
-    # Scanning bottom-up finds the full untruncated version (which directories
-    # render at the bottom) before the visually-clamped top snippet.
     if not best or len(best) < 150:
         all_paras = soup.find_all("p")
         for p in reversed(all_paras):
@@ -558,11 +524,9 @@ def _universal_description(soup, structured_desc: str) -> str:
             text = p.get_text(separator=" ", strip=True)
             if _good_desc(text) and not _is_false_description(text):
                 best = _better(best, text)
-                # Once we have a solid long candidate stop scanning
                 if len(best) >= 300:
                     break
 
-    # ── Strategy 6: Fall back ─────────────────────────────────────────────────
     if not best:
         if structured_desc and _good_desc(structured_desc):
             return structured_desc
@@ -572,8 +536,6 @@ def _universal_description(soup, structured_desc: str) -> str:
 
 
 def _universal_website(soup) -> str:
-    """Find the business's own website URL using universal signals."""
-    # Labeled link patterns
     website_re = re.compile(r"(visit website|official site|our website|web site|homepage)", re.IGNORECASE)
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -586,14 +548,12 @@ def _universal_website(soup) -> str:
         if website_re.search(txt) or "website" in cls or "external" in cls:
             return href
 
-    # itemprop="url"
     url_tag = soup.find(itemprop="url")
     if url_tag:
         href = url_tag.get("href", "") or url_tag.get("content", "")
         if href.startswith("http") and not any(s in href for s in _SKIP_DOMAINS):
             return href
 
-    # rel="nofollow" external links (directories often wrap business URLs this way)
     for a in soup.find_all("a", href=True, rel=True):
         rel = " ".join(a.get("rel", []))
         href = a["href"]
@@ -601,7 +561,6 @@ def _universal_website(soup) -> str:
             if not any(s in href for s in _SKIP_DOMAINS):
                 return href
 
-    # Redirect wrapper pattern (nearfinderus: /redirect?url=...)
     from urllib.parse import unquote
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -611,7 +570,6 @@ def _universal_website(soup) -> str:
             if not any(s in decoded for s in _SKIP_DOMAINS) and not any(s in decoded for s in _SOCIAL_DOMAINS):
                 return decoded
 
-    # First external link
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith("http") and not any(s in href for s in _SKIP_DOMAINS):
@@ -621,17 +579,14 @@ def _universal_website(soup) -> str:
 
 
 def _universal_social(soup) -> str:
-    """Collect all social media links from any page."""
     from urllib.parse import unquote
     links = []
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # Direct social link
         if any(s in href for s in _SOCIAL_DOMAINS):
             links.append(href)
             continue
-        # Encoded in redirect wrapper
         redirect_match = re.search(r"/redirect\?url=([^&\s]+)", href)
         if redirect_match:
             decoded = unquote(redirect_match.group(1))
@@ -642,15 +597,6 @@ def _universal_social(soup) -> str:
 
 
 def _universal_hours(soup, structured_hours: str) -> str:
-    """
-    Find business hours using universal patterns.
-
-    Handles:
-    - JSON-LD / itemprop structured hours (passed in as structured_hours)
-    - nearfinderus "00:00 to 00:00" JS placeholders → rejected
-    - hotfrog opening-hours table with day + time rows
-    - Any container/element with day names + real time values
-    """
     _PLACEHOLDER_RE = re.compile(
         r"0{1,2}:0{2}\s*(?:to|-|–|–)\s*0{1,2}:0{2}", re.IGNORECASE
     )
@@ -669,14 +615,12 @@ def _universal_hours(soup, structured_hours: str) -> str:
     )
 
     def _is_placeholder_only(text: str) -> bool:
-        """True when every time value in the string is a 00:00 placeholder."""
         real_times = re.findall(r"\d{1,2}:\d{2}", text)
         if not real_times:
             return False
         return all(re.match(r"^0{1,2}:0{2}$", t) for t in real_times)
 
     def _hours_valid(text: str) -> bool:
-        """Return True when text looks like real hours (not review/phone/placeholder)."""
         if not text or len(text) > 700:
             return False
         if _PHONE_IN_TEXT.search(text):
@@ -685,20 +629,16 @@ def _universal_hours(soup, structured_hours: str) -> str:
             return False
         if _is_placeholder_only(text):
             return False
-        # Count placeholders vs day mentions
         placeholder_count = len(_PLACEHOLDER_RE.findall(text))
         day_count = len(_DAY_RE.findall(text))
         if day_count > 0 and placeholder_count >= day_count:
             return False
-        # Must have at least one day AND one time signal
         return bool(_DAY_RE.search(text) and _TIME_RE.search(text))
 
-    # ── Step 1: Structured hours from JSON-LD / itemprop ─────────────────────
     if structured_hours and not _is_placeholder_only(structured_hours):
         if _hours_valid(structured_hours) or re.search(r"\b(open|closed|24)\b", structured_hours, re.IGNORECASE):
             return structured_hours
 
-    # ── Step 2: itemprop="openingHours" content attribute ────────────────────
     oh_tags = soup.find_all(attrs={"itemprop": "openingHours"})
     if oh_tags:
         hrs = []
@@ -711,8 +651,6 @@ def _universal_hours(soup, structured_hours: str) -> str:
             if not _is_placeholder_only(candidate):
                 return candidate
 
-    # ── Step 3: Table rows inside an hours container ──────────────────────────
-    # hotfrog renders hours as a 2-column table (Day | Time range)
     for table in soup.find_all("table"):
         cls = _cls_str(table)
         parent_cls = _cls_str(table.parent) if table.parent and hasattr(table.parent, "get") else ""
@@ -736,7 +674,6 @@ def _universal_hours(soup, structured_hours: str) -> str:
         if row_parts:
             return "; ".join(row_parts)
 
-    # ── Step 4: Div/section containers with hours class/id ───────────────────
     for tag in soup.find_all(["div", "section", "ul", "dl"]):
         cls = _cls_str(tag)
         if not _HOURS_CONTAINER_RE.search(cls):
@@ -749,7 +686,6 @@ def _universal_hours(soup, structured_hours: str) -> str:
         if _hours_valid(text):
             return text
 
-    # ── Step 5: Any element with day + time pattern ───────────────────────────
     for tag in soup.find_all(["p", "div", "li", "span", "td", "dd"]):
         if _is_hidden(tag):
             continue
@@ -761,15 +697,10 @@ def _universal_hours(soup, structured_hours: str) -> str:
 
 
 def _universal_category(soup) -> str:
-    """Extract business category using universal signals."""
-    # itemprop
     cat = _itemprop(soup, "category")
     if cat and len(cat) < 80:
         return cat
 
-    # JSON-LD already handled in _extract_structured
-
-    # Breadcrumb navigation
     for nav in soup.find_all(["nav", "ol", "ul", "div"],
                               class_=re.compile(r"breadcrumb", re.I)):
         items = nav.find_all(["li", "a", "span"])
@@ -779,56 +710,178 @@ def _universal_category(soup) -> str:
             if 3 < len(candidate) < 60:
                 return candidate
 
-    # URL-based category slug (e.g. /category_water-damage-restoration/ or /fire-water-damage-repair)
-    # We don't have the URL here, so skip. Handled in build_prompt via page text.
-
     return ""
 
 
 def _universal_keywords(soup) -> str:
     """
-    Keywords ONLY from <meta name="keywords">.
-    Never inferred from page content.
+    Keywords from:
+      1. <meta name="keywords"> — highest priority, used verbatim
+      2. "Business tags" / "Tags" DOM sections — explicitly excluding "Location tags"
+
+    KEY RULES:
+    - Never split multi-word tags on spaces (preserves "ChatGPT Ads Agency" intact)
+    - "Location tags" sibling containers are excluded (brownbook pattern)
+    - Only comma, pipe, semicolon, or period used as tag separators
     """
+
+    # ── Priority 1: meta keywords ──────────────────────────────────────────
     meta_kw = soup.find("meta", attrs={"name": "keywords"})
     if meta_kw:
         raw = meta_kw.get("content", "").strip()
         if raw:
             return _clean_keywords(raw)
 
-    # Also check common "Tags:" / "Business tags" patterns in DOM text
+    # ── Patterns ───────────────────────────────────────────────────────────
+    _BIZ_TAG_RE = re.compile(
+        r"\b(business\s+tags?|tags?|keywords?|services?\s+offered)\b",
+        re.IGNORECASE,
+    )
+    # Location-flavored labels — containers/headings matching this are skipped
+    _LOC_TAG_RE = re.compile(
+        r"\b(location\s+tags?|location|city|cities|region|area|"
+        r"local\s+tags?|geo\s+tags?)\b",
+        re.IGNORECASE,
+    )
+
+    def _collect_tag_items(container) -> list:
+        """
+        Collect individual keyword/tag texts from a container.
+        Prefers <a> and <span> child tags (each tag = one keyword).
+        Falls back to splitting the plain text on comma/pipe/semicolon/period.
+        Never splits on spaces to preserve multi-word phrases.
+        """
+        items = []
+        # Try child link/tag elements first — each child = one complete keyword
+        children = container.find_all(["a", "span", "li", "strong", "em"], recursive=True)
+        if children:
+            for child in children:
+                txt = child.get_text(strip=True)
+                # Skip if this is clearly a navigation link (has href pointing elsewhere)
+                if child.name == "a":
+                    href = child.get("href", "")
+                    if href and not href.startswith("#"):
+                        # External or internal nav link — skip
+                        if any(d in href for d in _SKIP_DOMAINS):
+                            continue
+                if txt and 2 < len(txt) < 100:
+                    items.append(txt)
+        if items:
+            return items
+        # Fallback: plain text split on separators (never on spaces)
+        raw = container.get_text(strip=True)
+        parts = re.split(r"[,|;.]", raw)
+        return [p.strip() for p in parts if p.strip() and 2 < len(p.strip()) < 100]
+
+    def _is_location_container(tag) -> bool:
+        """Return True if this tag looks like a location/geo tag container."""
+        cls = _cls_str(tag)
+        txt = tag.get_text(strip=True)[:60]
+        return bool(_LOC_TAG_RE.search(cls) or _LOC_TAG_RE.search(txt))
+
+    # ── Strategy A: heading/label → sibling content (NOT location) ────────
+    # Handles brownbook "Business tags" heading + "Location tags" heading pattern.
+    # We find a "Business tags" heading, then read its sibling/child content
+    # while stopping before any "Location tags" sibling.
+    for label_tag in soup.find_all(
+        ["h2", "h3", "h4", "h5", "strong", "b", "p", "div", "span", "td", "th"]
+    ):
+        label_txt = label_tag.get_text(strip=True)
+        if not _BIZ_TAG_RE.search(label_txt):
+            continue
+        # Skip "Location tags" headings
+        if _LOC_TAG_RE.search(label_txt):
+            continue
+        # Skip nav/footer containers
+        if _container_is_nav(label_tag):
+            continue
+
+        # Check if siblings of the heading's parent contain the tags
+        parent = label_tag.parent
+        if parent and hasattr(parent, "get"):
+            if not _is_location_container(parent):
+                items = _collect_tag_items(parent)
+                # Remove the label text itself from results
+                items = [i for i in items if i.lower() != label_txt.lower()]
+                if items:
+                    result = _clean_keywords(", ".join(items))
+                    if result:
+                        return result
+
+        # Follow next siblings — stop at location-tag sibling
+        for sib in label_tag.find_next_siblings():
+            sib_txt = sib.get_text(strip=True) if hasattr(sib, "get_text") else ""
+            if not sib_txt:
+                continue
+            # Stop if we've reached a "Location tags" section
+            if _is_location_container(sib):
+                break
+            # Stop if next unrelated heading
+            if hasattr(sib, "name") and sib.name in ("h2", "h3", "h4"):
+                if not _BIZ_TAG_RE.search(sib_txt):
+                    break
+            items = _collect_tag_items(sib)
+            if items:
+                result = _clean_keywords(", ".join(items))
+                if result:
+                    return result
+            break  # only consume first non-empty sibling
+
+    # ── Strategy B: containers with tag/keyword class/id ──────────────────
+    _TAG_CLS_RE = re.compile(
+        r"\b(business[-_]?tags?|listing[-_]?tags?|tags?[-_]?list|"
+        r"keywords?[-_]?list|tag[-_]?container|tag[-_]?cloud|chips?|"
+        r"tag[-_]?wrapper|tag[-_]?group)\b",
+        re.IGNORECASE,
+    )
+    for container in soup.find_all(["div", "ul", "section", "p", "span"]):
+        cls = _cls_str(container)
+        if not _TAG_CLS_RE.search(cls):
+            continue
+        if _is_location_container(container):
+            continue
+        if _is_hidden(container):
+            continue
+        items = _collect_tag_items(container)
+        if items:
+            result = _clean_keywords(", ".join(items))
+            if result:
+                return result
+
+    # ── Strategy C: "Tags:" / "Keywords:" label in plain text ─────────────
     full_text = soup.get_text(separator="\n", strip=True)
     for pattern in [
-        r"(?:^|\n)\s*tags?\s*:\s*([^\n]{3,200})",
-        r"business\s+tags?\s*\n([^\n]{3,200})",
-        r"keywords?\s*\n([^\n]{3,200})",
+        r"(?:^|\n)\s*business\s+tags?\s*:?\s*\n([^\n]{3,200})",
+        r"(?:^|\n)\s*tags?\s*:?\s*\n([^\n]{3,200})",
+        r"(?:^|\n)\s*keywords?\s*:?\s*\n([^\n]{3,200})",
     ]:
         m = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
         if m:
-            raw = re.sub(r"\s*[|\s]\s*", ", ", m.group(1).strip())
-            cleaned = _clean_keywords(raw)
+            raw = m.group(1).strip()
+            # Split only on non-space separators to preserve multi-word tags
+            parts = [p.strip() for p in re.split(r"[,|;.]", raw) if p.strip()]
+            cleaned = _clean_keywords(", ".join(parts))
             if cleaned:
                 return cleaned
 
-    # Check DOM elements with label text
+    # ── Strategy D: DOM label element → next sibling ──────────────────────
     for tag in soup.find_all(["h2", "h3", "h4", "strong", "b", "p", "div", "span"]):
         txt = tag.get_text(strip=True)
-        if re.match(r"^(tags?|business\s+tags?|keywords?)\s*:?\s*$", txt, re.IGNORECASE):
-            for sib in tag.find_next_siblings():
-                sib_text = sib.get_text(separator=", ", strip=True)
-                if sib_text and len(sib_text) < 300:
-                    cleaned = _clean_keywords(sib_text)
+        if not re.match(r"^(tags?|business\s+tags?|keywords?)\s*:?\s*$", txt, re.IGNORECASE):
+            continue
+        for sib in tag.find_next_siblings():
+            sib_txt = sib.get_text(strip=True) if hasattr(sib, "get_text") else ""
+            if not sib_txt or _is_location_container(sib):
+                continue
+            if len(sib_txt) < 300:
+                items = _collect_tag_items(sib)
+                if not items:
+                    items = [p.strip() for p in re.split(r"[,|;.]", sib_txt) if p.strip()]
+                if items:
+                    cleaned = _clean_keywords(", ".join(items))
                     if cleaned:
                         return cleaned
-                    break
-            # Try links inside parent
-            parent = tag.parent
-            if parent:
-                links = [a.get_text(strip=True) for a in parent.find_all("a") if a.get_text(strip=True)]
-                if links:
-                    cleaned = _clean_keywords(", ".join(links))
-                    if cleaned:
-                        return cleaned
+            break
 
     return ""
 
@@ -842,12 +895,10 @@ def _universal_gbp(soup) -> str:
 
 
 def _universal_email(soup) -> str:
-    # mailto: links
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith("mailto:"):
             return href[7:].split("?")[0].strip()
-    # Plain text email pattern
     text = soup.get_text()
     match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
     if match:
@@ -860,18 +911,15 @@ def _universal_email(soup) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_logo(soup, structured: dict) -> bool:
-    # JSON-LD / og:image logo
     if structured.get("logo_url"):
         return True
 
-    # itemprop="image"
     tag = soup.find(attrs={"itemprop": "image"})
     if tag:
         src = tag.get("src", tag.get("content", ""))
         if src and src.startswith("http") and not _is_tiny(tag, 20):
             return True
 
-    # <img> with logo signals in src, class, id, alt, or parent class
     for img in soup.find_all("img"):
         srcs = _all_srcs(img)
         if not srcs:
@@ -896,13 +944,11 @@ def _detect_logo(soup, structured: dict) -> bool:
 
 
 def _detect_photos(soup, structured: dict) -> bool:
-    # JSON-LD images
     if len(structured.get("image_urls", [])) >= 1:
         for url in structured["image_urls"]:
             if not _UI_IMAGE_PATTERNS.search(url):
                 return True
 
-    # Hero/gallery/carousel containers
     hero_re = re.compile(
         r"(hero|banner|cover|carousel|slider|slideshow|gallery|"
         r"featured|backdrop|jumbotron|photo[-_]?section|media[-_]?section)",
@@ -915,12 +961,10 @@ def _detect_photos(soup, structured: dict) -> bool:
             srcs = _all_srcs(img)
             if srcs and not _is_tiny(img, 40) and not _UI_IMAGE_PATTERNS.search(srcs[0]):
                 return True
-        # CSS background in style attribute
         style = container.get("style", "")
         if "background" in style.lower() and "url(" in style.lower():
             return True
 
-    # CSS background-image anywhere on page
     for tag in soup.find_all(style=True):
         style_val = tag.get("style", "")
         bg_urls = re.findall(
@@ -931,7 +975,6 @@ def _detect_photos(soup, structured: dict) -> bool:
             if url.strip() and not _UI_IMAGE_PATTERNS.search(url):
                 return True
 
-    # Photo/gallery links
     for a in soup.find_all("a", href=True):
         txt = a.get_text(strip=True).lower()
         href = a.get("href", "").lower()
@@ -939,7 +982,6 @@ def _detect_photos(soup, structured: dict) -> bool:
             if not any(d in href for d in ("google", "facebook", "twitter", "instagram")):
                 return True
 
-    # Count large non-UI images
     large_count = 0
     for img in soup.find_all("img"):
         srcs = _all_srcs(img)
@@ -972,11 +1014,27 @@ _KW_NOISE_RE = re.compile(
     r"trip planner?|travel|maps?|location|venue|place|trip)\s*$",
     re.IGNORECASE,
 )
+# US state names and abbreviations — used to filter location tags from keyword lists
+_US_STATE_RE = re.compile(
+    r"^(alabama|alaska|arizona|arkansas|california|colorado|connecticut|"
+    r"delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|"
+    r"kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|"
+    r"mississippi|missouri|montana|nebraska|nevada|new\s+hampshire|new\s+jersey|"
+    r"new\s+mexico|new\s+york|north\s+carolina|north\s+dakota|ohio|oklahoma|"
+    r"oregon|pennsylvania|rhode\s+island|south\s+carolina|south\s+dakota|"
+    r"tennessee|texas|utah|vermont|virginia|washington|west\s+virginia|"
+    r"wisconsin|wyoming|"
+    r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|"
+    r"MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|"
+    r"VT|VA|WA|WV|WI|WY|DC)$",
+    re.IGNORECASE,
+)
 
 
 def _clean_keywords(raw: str, business_name: str = "") -> str:
     if not raw:
         return ""
+    # Split on comma, pipe, or semicolon only — never on spaces
     tokens = [t.strip() for t in re.split(r"[,|;]", raw) if t.strip()]
     bn_lower = business_name.lower().strip()
     cleaned = []
@@ -988,7 +1046,10 @@ def _clean_keywords(raw: str, business_name: str = "") -> str:
             continue
         if re.search(r"\b\d{5}\b", tok):
             continue
+        # Filter bare city, state combos (e.g. "Newark, DE" already split to "Newark" + "DE")
         if re.match(r"^[a-z\s]+,?\s+[a-z]{2}$", tok, re.IGNORECASE):
+            continue
+        if _US_STATE_RE.match(tok):
             continue
         if re.match(r"^[a-z]{2}$", tok, re.IGNORECASE):
             continue
@@ -1001,16 +1062,33 @@ def _clean_keywords(raw: str, business_name: str = "") -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Cloudflare detector
+#  Cloudflare / error page detector
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CF_SIGNALS = (
+    # Standard Cloudflare challenge pages
     "cloudflare.com?utm_source=challenge",
     "cf_chl_",
     "cdn-cgi/challenge-platform",
     "Just a moment",
     "checking your browser",
     "DDoS protection by Cloudflare",
+    # Cloudflare 522 "Connection Timed Out" error pages
+    "error 522",
+    "522: connection timed out",
+    "522 origin connection time-out",
+    "contact your hosting provider",
+    "your web server is not completing requests",
+    "an error 522 means",
+    "the request didn't finish",
+    # Cloudflare 520 / 524 / 525 variants
+    "error 520",
+    "error 524",
+    "error 525",
+    "cloudflare ray id",
+    # Generic origin unreachable
+    "origin web server timed out",
+    "the web server reported a bad gateway error",
 )
 
 
@@ -1024,15 +1102,8 @@ def _is_cloudflare(html: str, text: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_url_slug(url: str) -> dict:
-    """
-    Universal URL slug parser. Attempts to extract Name, City, State, ZIP
-    from the URL path segment when page rendering yields no content.
-    Works for enrollbusiness-style paths:
-      /BusinessProfile/7819046/WrightWay-Emergency-Services-Nokomis-FL-34275
-    """
     out = {"name": "", "city": "", "state": "", "zip": ""}
     try:
-        # Find the last meaningful path segment
         path = url.rstrip("/").split("?")[0]
         segments = [s for s in path.split("/") if s and not s.isdigit()]
         if not segments:
@@ -1143,12 +1214,12 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
     if hints.get("cloudflare_blocked"):
         return (
             "You are a business data extraction assistant.\n"
-            "This page returned a Cloudflare security challenge and contains NO real business data.\n"
+            "This page returned a Cloudflare security challenge or connection error "
+            "and contains NO real business data.\n"
             f"Return ONLY a JSON object with null for every field: {fields}\n"
             f"Example: {{{', '.join(repr(f)+': null' for f in fields)}}}"
         )
 
-    # Build pre-extracted facts section
     facts = []
 
     if hints["logo_confirmed"]:
@@ -1178,7 +1249,6 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
         if val:
             facts.append(f"{label}:\n{val}")
 
-    # Page content
     if len(page_html) > 20000:
         html_snippet = page_html[:15000] + "\n\n…[middle omitted]…\n\n" + page_html[-5000:]
     else:
@@ -1209,11 +1279,10 @@ def build_prompt(page_text: str, page_html: str, fields: list, source: str = "")
 
     content = "\n\n".join(parts)
 
-    # Field-specific instructions
     field_rules = []
     for f in fields:
         if f == "Name":
-            field_rules.append('- "Name": primary business name.')
+            field_rules.append('- "Name": primary business name only. Never return a website domain or URL.')
         elif f == "Phone":
             field_rules.append('- "Phone": phone number — digits and separators only.')
         elif f == "Website URL":
@@ -1301,6 +1370,7 @@ CRITICAL RULES:
 - Website URL: NEVER return a cloudflare.com URL.
 - Hours: NEVER return "00:00 to 00:00" placeholders — return null instead.
 - Keywords: ONLY from PRE-EXTRACTED FIELDS — never inferred from page content.
+- Name: NEVER return a website domain (e.g. "nearfinderus.com") as the business name.
 
 FIELD INSTRUCTIONS:
 {rules_text}
@@ -1446,6 +1516,18 @@ def extract_fields(
 
         # ── Final guards ───────────────────────────────────────────────────
 
+        # Name: reject if it looks like a domain name (e.g. "nearfinderus.com")
+        if "Name" in fields:
+            name_val = extracted.get("Name", "") or ""
+            if name_val and _DOMAIN_NAME_RE.search(name_val):
+                hint_name = hints.get("name", "")
+                # Use hint only if it doesn't also look like a domain
+                extracted["Name"] = (
+                    hint_name
+                    if hint_name and not _DOMAIN_NAME_RE.search(hint_name)
+                    else None
+                )
+
         # Website: strip cloudflare URLs
         if "Website URL" in fields:
             url_val = extracted.get("Website URL", "") or ""
@@ -1464,9 +1546,7 @@ def extract_fields(
                 elif re.search(r"\breview\b", hours_val, re.IGNORECASE) and not re.search(r"\d{1,2}:\d{2}", hours_val):
                     extracted["Hours"] = None
                 elif real_times and all(re.match(r"^0{1,2}:0{2}$", t) for t in real_times):
-                    # Every time value is 00:00 — all placeholder, nullify
                     extracted["Hours"] = None
-                    # Try to rescue from hints
                     if hints.get("hours"):
                         extracted["Hours"] = hints["hours"]
                 elif len(placeholder_times) > 0 and len(placeholder_times) >= len(real_times):
