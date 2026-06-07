@@ -199,7 +199,7 @@ st.markdown('<div class="section-header">④ Run Analysis & Download Report</div
 
 run_disabled = not (known_urls and gemini_api_key and scraper_api_key)
 
-if st.button("🚀 Start Analysis", disabled=run_disabled, type="primary"):
+if st.button("Start Analysis", disabled=run_disabled, type="primary"):
     if not gemini_api_key:
         st.error("Please enter your Gemini API key.")
         st.stop()
@@ -312,7 +312,7 @@ if st.button("🚀 Start Analysis", disabled=run_disabled, type="primary"):
         progress.progress(0.92)
 
         # ── Stage 4: Excel ────────────────────────────────────────────────
-        status_box.info("📝 Generating Excel report…")
+        status_box.info("Generating Excel report…")
         excel_bytes = write_excel(results)
         progress.progress(1.0)
         st.session_state.results = results
@@ -328,7 +328,7 @@ if st.button("🚀 Start Analysis", disabled=run_disabled, type="primary"):
         c3.metric("❌ Issues Found", incorrect)
 
         st.download_button(
-            label="⬇️ Download Excel Report",
+            label="Download Excel Report",
             data=excel_bytes,
             file_name=make_filename(user_data.get("Name", "")),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -337,7 +337,7 @@ if st.button("🚀 Start Analysis", disabled=run_disabled, type="primary"):
         )
 
     except Exception as e:
-        status_box.error(f"❌ Error: {e}")
+        status_box.error(f"Error: {e}")
         st.exception(e)
 
 elif run_disabled:
@@ -345,7 +345,7 @@ elif run_disabled:
     if not gemini_api_key:   hints.append("enter your Gemini API key")
     if not scraper_api_key:  hints.append("enter your ScraperAPI key")
     if not known_urls:       hints.append("paste at least one recognised directory URL")
-    st.caption(f"⬆️ Please {' and '.join(hints)} to enable analysis.")
+    st.caption(f"Please {' and '.join(hints)} to enable analysis.")
 
 # ── Re-download previous results ──────────────────────────────────────────────
 if st.session_state.results:
@@ -353,7 +353,7 @@ if st.session_state.results:
     st.markdown("**Previous results still available:**")
     excel_bytes = write_excel(st.session_state.results)
     st.download_button(
-        label="⬇️ Re-download Last Report",
+        label="Re-download Last Report",
         data=excel_bytes,
         file_name=make_filename(st.session_state.user_data.get("Name", "")),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
