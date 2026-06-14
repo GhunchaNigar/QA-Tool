@@ -31,10 +31,10 @@ JS_RENDER_FIRST_DOMAINS = [
     "zumvu.com",
     "provenexpert.com",
     "foursquare.com",
+    "askmap.net",
 ]
 
 STATIC_DOMAINS = [
-    "askmap.net",
     "freelistingusa.com",
 ]
 
@@ -94,10 +94,16 @@ JS_RENDER_CONFIG = {
         "premium_first": True,
         "playwright_timeout": 55000,
     },
+    "askmap.net": {
+        # Needs JS render to load images; cookie banner must be dismissed first
+        "wait": "8000",
+        "wait_for_selector": "h1",
+        "playwright_timeout": 45000,
+    },
 }
 
 DOMAIN_MIN_CHARS = {
-    "askmap.net":          150,
+    "askmap.net":          800,
     "freelistingusa.com":  100,
     "smallbusinessusa.com": 150,
 }
