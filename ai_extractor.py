@@ -1012,34 +1012,86 @@ def _universal_email(soup) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_logo(soup, structured: dict) -> bool:
-    if structured.get("logo_url"):
-        return True
+    """
+    Detect whether a business logo is present on the page.
 
+    Deliberately conservative to avoid false-positives on sites like
+    callupcontact and gravitysplash where the directory's own site-chrome
+    images (header logo, partner badges, etc.) would otherwise trigger a
+    false PRESENT.
+
+    Rules (ordered by confidence):
+    1. JSON-LD / structured data logo URL  → highest confidence
+    2. itemprop="image" with a real src   → high confidence
+    3. <img> whose OWN src/class/alt contains a logo signal AND whose
+       immediate parent also signals a profile/listing context
+       (NOT just any ancestor — avoids header/nav logos firing)
+    4. <img> with alt text exactly matching "<business name> logo"
+    """
+    # 1. Structured data
+    if structured.get("logo_url"):
+        # Extra guard: make sure the URL isn't just the og:image site banner
+        logo_url = structured["logo_url"]
+        # If it contains UI/template patterns it's probably not a business logo
+        if not _UI_IMAGE_PATTERNS.search(logo_url):
+            return True
+
+    # 2. Schema.org itemprop
     tag = soup.find(attrs={"itemprop": "image"})
     if tag:
         src = tag.get("src", tag.get("content", ""))
-        if src and src.startswith("http") and not _is_tiny(tag, 20):
-            return True
+        if src and src.startswith("http") and not _is_tiny(tag, 30):
+            if not _UI_IMAGE_PATTERNS.search(src):
+                return True
 
+    # 3. <img> with logo signals in the img itself AND immediate parent context
+    #    — do NOT walk the whole ancestor chain (avoids site-header logos)
+    _LOGO_CONTEXT_RE = re.compile(
+        r"(profile|listing|business|company|member|vendor|merchant|"
+        r"provider|establishment|directory[-_]?item)",
+        re.IGNORECASE,
+    )
     for img in soup.find_all("img"):
         srcs = _all_srcs(img)
         if not srcs:
             continue
         src = srcs[0]
         cls = _cls_str(img)
-        parent_cls = " ".join(
-            _cls_str(p) for p in img.parents
-            if hasattr(p, "get") and p.name not in ("html", "body")
-        )[:300]
         alt = img.get("alt", "").lower()
 
-        if _is_tiny(img, 20) or _UI_IMAGE_PATTERNS.search(src):
+        if _is_tiny(img, 30) or _UI_IMAGE_PATTERNS.search(src):
             continue
 
-        if (_LOGO_SIGNALS.search(src) or _LOGO_SIGNALS.search(cls)
-                or _LOGO_SIGNALS.search(parent_cls)
-                or re.search(r"\b(logo|brand|emblem)\b", alt)):
-            return True
+        # Direct signal on the img element itself
+        has_logo_in_src = bool(_LOGO_SIGNALS.search(src))
+        has_logo_in_cls = bool(_LOGO_SIGNALS.search(cls))
+        has_logo_in_alt = bool(re.search(r"\b(logo|brand|emblem)\b", alt))
+
+        if has_logo_in_src or has_logo_in_cls or has_logo_in_alt:
+            # Make sure this isn't the directory's own site header/nav logo
+            parent = img.parent
+            if parent and hasattr(parent, "get"):
+                parent_cls = _cls_str(parent)
+                # Skip if the immediate parent looks like a site-wide header/nav
+                if re.search(r"\b(header|navbar|nav[-_]?bar|site[-_]?logo|"
+                              r"brand[-_]?logo|top[-_]?bar|masthead)\b",
+                              parent_cls, re.IGNORECASE):
+                    continue
+                # Require: parent should look like a listing/profile context,
+                # OR the img src itself already has a strong logo signal
+                if has_logo_in_src or _LOGO_CONTEXT_RE.search(parent_cls):
+                    return True
+
+        # 4. Alt text of the form "<word> logo" or "logo" alone
+        if re.match(r"^[\w\s]{1,50}\s+logo$", alt) or alt == "logo":
+            if not _is_tiny(img, 30):
+                # Again, skip if inside a site header
+                parent = img.parent
+                if parent and hasattr(parent, "get"):
+                    if re.search(r"\b(header|navbar|nav[-_]?bar|site[-_]?logo)\b",
+                                 _cls_str(parent), re.IGNORECASE):
+                        continue
+                return True
 
     return False
 
@@ -1192,6 +1244,34 @@ _CF_SIGNALS = (
     "the web server reported a bad gateway error",
 )
 
+# Signals that a page is a cookie-consent / bot-check interstitial with no
+# real business data — treat the same as a Cloudflare block.
+_INTERSTITIAL_SIGNALS = (
+    "cookiebot by usercentrics",
+    "powered by cookiebot",
+    "consent.cookiebot.com",
+    "usercentrics",
+    "cookiebot",
+    "this site uses cookies",  # generic consent page with no other content
+)
+
+# Minimum meaningful text length for a page that has real business content.
+# Pages shorter than this are likely interstitials / error pages.
+_MIN_REAL_CONTENT_CHARS = 300
+
+
+def _is_interstitial(html: str, text: str) -> bool:
+    """
+    Returns True when the page appears to be a cookie/bot interstitial rather
+    than a real business listing — i.e. no actionable data can be extracted.
+    Only fires when the page is also very short, to avoid false positives on
+    legit pages that happen to mention cookies in a footer.
+    """
+    if len(text.strip()) > _MIN_REAL_CONTENT_CHARS:
+        return False   # page has real content — don't block extraction
+    combined = (html[:3000] + text[:1000]).lower()
+    return any(s.lower() in combined for s in _INTERSTITIAL_SIGNALS)
+
 
 def _is_cloudflare(html: str, text: str) -> bool:
     combined = (html[:5000] + text[:2000]).lower()
@@ -1265,7 +1345,7 @@ def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dic
     if not page_html:
         return hints
 
-    if _is_cloudflare(page_html, page_text):
+    if _is_cloudflare(page_html, page_text) or _is_interstitial(page_html, page_text):
         hints["cloudflare_blocked"] = True
         return hints
 
