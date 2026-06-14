@@ -129,7 +129,12 @@ SOURCE_FIELDS = {
 
 VISUAL_FIELDS = {"Logo", "Photos"}
 
-NA_OVERRIDES = {}
+NA_OVERRIDES = {
+    # These directories don't display a business email on the listing page,
+    # so "Business Email" should be N/A rather than flagged MISSING.
+    "gravitysplash.com":  ["Business Email"],
+    "thelocal.directory": ["Business Email"],
+}
 
 # No site-specific layout hints — Gemini searches the whole page for each field.
 SOURCE_PROMPT_HINTS = {}
