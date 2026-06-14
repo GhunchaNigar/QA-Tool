@@ -1,20 +1,3 @@
-"""
-logo_matcher.py
-Compares candidate images found on a directory listing page against the
-user's own uploaded business logo.
-
-Directories almost never host a byte-identical copy of the logo (they
-resize, recompress, convert format, add padding, etc.), so a raw
-MD5/SHA hash comparison would basically never match. Instead we use
-perceptual hashing (pHash / average hash / dHash via the `imagehash`
-library) — this produces a fingerprint based on the image's visual
-appearance, so a resized/recompressed copy of the SAME logo still
-matches, while a genuinely different image does not.
-
-A small Hamming-distance threshold keeps this close to "exact match"
-(near-zero false positives) while tolerating routine re-encoding.
-"""
-
 import io
 from urllib.parse import urljoin
 
@@ -140,16 +123,90 @@ def find_matching_image(
     ref_hashes: dict,
     page_url: str = "",
     threshold: int = DEFAULT_THRESHOLD,
-    max_checks: int = 20,
 ) -> str | None:
     """
-    Check candidate image URLs (in order) against the reference logo.
+    Check ALL candidate image URLs against the reference logo.
     Returns the first matching URL, or None if no match is found.
-    Stops after `max_checks` downloads to bound latency.
+    Every candidate is checked — no early cutoff.
     """
     if not ref_hashes:
         return None
-    for url in candidate_urls[:max_checks]:
+    for url in candidate_urls:
         if url_matches_reference(url, ref_hashes, page_url, threshold):
             return url
     return None
+
+
+def find_matching_image_debug(
+    candidate_urls: list,
+    ref_hashes: dict,
+    page_url: str = "",
+    threshold: int = DEFAULT_THRESHOLD,
+) -> tuple:
+    """
+    Check ALL candidate image URLs against the reference logo.
+    Returns (matched_url | None, checked_list) where checked_list is a list
+    of dicts with keys: url, downloaded, best_distance, matched.
+
+    Every candidate is checked — no early cutoff — so no image is skipped.
+    Once a match is found the URL is returned immediately but the loop
+    still records the result for the debug output.
+    """
+    if not ref_hashes:
+        return None, []
+
+    checked = []
+    matched_url = None
+
+    for url in candidate_urls:
+        entry = {"url": url, "downloaded": False, "best_distance": None, "matched": False}
+
+        # Resolve relative / protocol-relative URLs
+        resolved = url
+        if resolved.startswith("//"):
+            resolved = "https:" + resolved
+        elif not resolved.startswith("http") and page_url:
+            from urllib.parse import urljoin
+            resolved = urljoin(page_url, resolved)
+
+        if not resolved.startswith("http"):
+            checked.append(entry)
+            continue
+
+        data = _fetch_image_bytes(resolved)
+        if not data:
+            checked.append(entry)
+            continue
+
+        entry["downloaded"] = True
+
+        # Compute best Hamming distance across all hash functions
+        try:
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception:
+            checked.append(entry)
+            continue
+
+        best_dist = None
+        is_match = False
+        for name, fn in _HASH_FUNCS.items():
+            ref = ref_hashes.get(name)
+            if ref is None:
+                continue
+            try:
+                dist = fn(img) - ref
+            except Exception:
+                continue
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+            if dist <= threshold:
+                is_match = True
+
+        entry["best_distance"] = best_dist
+        entry["matched"] = is_match
+        checked.append(entry)
+
+        if is_match and matched_url is None:
+            matched_url = resolved  # record first match; continue checking rest
+
+    return matched_url, checked
