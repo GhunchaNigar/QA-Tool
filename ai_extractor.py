@@ -1083,6 +1083,9 @@ def _detect_logo(soup, structured: dict, source: str = "") -> bool:
         if src and src.startswith("http") and not _is_tiny(tag, 20):
             return True
 
+    content_logo_candidates = []  # images with explicit logo signals in src/class/alt
+    fallback_candidates = []      # any non-trivial non-ad content-area image
+
     for img in soup.find_all("img"):
         srcs = _all_srcs(img)
         if not srcs:
@@ -1097,20 +1100,35 @@ def _detect_logo(soup, structured: dict, source: str = "") -> bool:
 
         if _is_tiny(img, 20) or _UI_IMAGE_PATTERNS.search(src):
             continue
-
-        # Skip the directory site's own logo/branding, ads, and nav/header/footer chrome
-        if _is_chrome_or_ad(img):
-            continue
         if _AD_NETWORK_RE.search(src) or _AD_NETWORK_RE.search(parent_cls):
             continue
         if brand and (brand in src.lower() or brand in cls
                        or brand in parent_cls.lower() or brand in alt):
             continue
 
+        # Strong signal: src/class/alt explicitly says "logo"
         if (_LOGO_SIGNALS.search(src) or _LOGO_SIGNALS.search(cls)
                 or _LOGO_SIGNALS.search(parent_cls)
                 or re.search(r"\b(logo|brand|emblem)\b", alt)):
-            return True
+            content_logo_candidates.append(src)
+            continue
+
+        # Skip pure site-chrome (nav/header/footer) for the fallback bucket only
+        if _is_chrome_or_ad(img):
+            continue
+
+        # Fallback: any remaining non-trivial content-area image
+        fallback_candidates.append(src)
+
+    if content_logo_candidates:
+        return True
+
+    # Fallback: if there is at least one non-trivial content-area image that
+    # passed all filters, treat it as the business logo.  Many simple directory
+    # listings (e.g. askmap.net) display the logo as a plain <img> with no
+    # "logo" keyword anywhere in its markup.
+    if fallback_candidates:
+        return True
 
     return False
 
