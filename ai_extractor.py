@@ -1142,31 +1142,42 @@ def _collect_logo_candidate_urls(soup, structured: dict, source: str = "") -> li
     if tag:
         _add(tag.get("src", tag.get("content", "")))
 
-    # All other non-trivial <img> elements, skipping the directory's own
-    # chrome/branding/ads. Note: we deliberately do NOT filter by directory
-    # brand name here (e.g. "gravitysplash") — many directories host listing
-    # images on their own CDN subdomain (cdn.gravitysplash.com), so that
-    # filter would remove legitimate candidates too. The perceptual-hash
-    # comparison against the reference logo is the real filter; being
-    # generous here just means a few extra (cheap, capped) downloads.
+    # Collect ALL <img> elements — every src variant (src, data-src, srcset, etc.)
+    # is included so no image is ever skipped.  The only filter applied here is
+    # the ad-network RE, which blocks known tracking pixels and ad-serving URLs
+    # that would never be a business logo.  All other filtering (tiny size,
+    # site-chrome, directory branding) is intentionally removed because the
+    # perceptual-hash comparison against the reference logo is the real filter:
+    # an image that doesn't match the reference simply doesn't contribute to the
+    # result, so being maximally inclusive here costs only a few extra downloads
+    # while preventing false-negative misses when the logo appears in an
+    # unexpected DOM location.
     for img in soup.find_all("img"):
-        srcs = _all_srcs(img)
-        if not srcs:
+        all_img_srcs = _all_srcs(img)
+        if not all_img_srcs:
             continue
-        src = srcs[0]
         parent_cls = " ".join(
             _cls_str(p) for p in img.parents
             if hasattr(p, "get") and p.name not in ("html", "body")
         )[:300]
+        for src in all_img_srcs:
+            if _AD_NETWORK_RE.search(src) or _AD_NETWORK_RE.search(parent_cls):
+                continue
+            _add(src)
 
-        if _is_tiny(img, 20) or _UI_IMAGE_PATTERNS.search(src):
-            continue
-        if _is_chrome_or_ad(img):
-            continue
-        if _AD_NETWORK_RE.search(src) or _AD_NETWORK_RE.search(parent_cls):
-            continue
-
-        _add(src)
+    # Also collect CSS background-image URLs — some directories display the
+    # business logo as a background-image on a <div> rather than an <img>.
+    import re as _re
+    for tag in soup.find_all(style=True):
+        bg_urls = _re.findall(
+            r"background(?:-image)?\s*:\s*url\(['\"]?([^'\"\)]+)['\"]?\)",
+            tag.get("style", ""), _re.IGNORECASE,
+        )
+        for bg_url in bg_urls:
+            bg_url = bg_url.strip()
+            if bg_url and not bg_url.startswith("data:"):
+                if not _AD_NETWORK_RE.search(bg_url):
+                    _add(bg_url)
 
     return candidates
 
@@ -1518,9 +1529,10 @@ def _extract_page_hints(
 
         # 4. Visual detection
         if logo_ref_hashes:
-            hints["logo_confirmed"] = _detect_logo_by_reference(
+            logo_matched, _logo_debug = _detect_logo_by_reference(
                 soup, structured, source, page_url, logo_ref_hashes
             )
+            hints["logo_confirmed"] = logo_matched
         else:
             hints["logo_confirmed"] = _detect_logo(soup, structured, source)
         hints["photos_confirmed"] = _detect_photos(soup, structured, source)
