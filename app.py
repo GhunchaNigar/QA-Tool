@@ -19,6 +19,7 @@ from scraper import scrape_batch
 from ai_extractor import extract_batch
 from comparator import compare_all
 from excel_writer import write_excel, make_filename
+import logo_matcher
 import subprocess, sys
 
 subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], 
@@ -61,6 +62,8 @@ st.markdown("""
 for key, default in [
     ("user_data", {}),
     ("results", None),
+    ("logo_ref_hashes", None),
+    ("_logo_bytes", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -111,6 +114,36 @@ for chunk in chunks:
                 )
 
 st.session_state.user_data = user_data
+
+# ── Reference logo upload (optional — enables exact-match Logo detection) ────
+logo_ref_hashes = None
+if user_data.get("Logo") == "present":
+    st.markdown("**Upload your business logo** _(optional)_")
+    st.caption(
+        "If you upload your logo here, the **Logo** field will only be marked "
+        "CORRECT when this exact image (allowing for resizing/recompression) "
+        "is found on the listing page — instead of just any logo-shaped image. "
+        "If you skip this, generic detection is used as before."
+    )
+    logo_file = st.file_uploader(
+        "Logo image (PNG/JPG)", type=["png", "jpg", "jpeg", "webp", "gif"],
+        key="logo_upload",
+    )
+    if logo_file is not None:
+        logo_bytes = logo_file.getvalue()
+        if st.session_state["_logo_bytes"] != logo_bytes:
+            st.session_state["_logo_bytes"] = logo_bytes
+            st.session_state["logo_ref_hashes"] = logo_matcher.compute_reference_hashes(logo_bytes)
+        if st.session_state["logo_ref_hashes"]:
+            st.image(logo_bytes, width=120, caption="Reference logo (will be matched exactly)")
+        else:
+            st.warning("Couldn't read that image — falling back to generic Logo detection.")
+    else:
+        st.session_state["_logo_bytes"] = None
+        st.session_state["logo_ref_hashes"] = None
+
+    logo_ref_hashes = st.session_state["logo_ref_hashes"]
+
 st.markdown("---")
 
 # ── STEP 2 — API keys ─────────────────────────────────────────────────────────
@@ -272,6 +305,7 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
             batch_result = extract_batch(
                 pages, src_fields, src, gemini_api_key,
                 progress_callback=on_progress,
+                logo_ref_hashes=logo_ref_hashes,
             )
             all_extracted.extend(batch_result)
 
