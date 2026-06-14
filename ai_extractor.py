@@ -1,3 +1,20 @@
+"""
+ai_extractor.py  —  Universal Edition
+Extracts business fields from any directory listing page using:
+  1. Structured data (JSON-LD, microdata, meta tags) — domain-agnostic standards
+  2. Universal DOM heuristics — works on any site layout
+  3. Gemini AI — fills gaps and resolves ambiguity
+
+No per-domain code paths. Every extractor rule applies to every URL.
+
+Fixes applied:
+  - Cloudflare 522 / connection error pages now detected and short-circuited
+  - Keywords: pipe-split bug fixed (multi-word tags like "ChatGPT Ads" preserved)
+  - Keywords: "Location tags" sibling containers excluded from keyword collection
+  - Keywords: "Business tags" containers explicitly targeted
+  - Post-processing: Name values that look like domain names are nullified
+"""
+
 import json
 import re
 from google import genai
@@ -131,58 +148,6 @@ def _is_hidden(tag) -> bool:
         if "visibility: hidden" in style or "visibility:hidden" in style:
             return True
     return False
-
-
-# ── Site-chrome / ad / directory-brand filters (for Logo & Photos detection) ──
-
-_CHROME_TAGS = {"header", "footer", "nav", "aside"}
-
-_CHROME_OR_AD_RE = re.compile(
-    r"\b(header|footer|nav(bar)?|topbar|masthead|sidebar|"
-    r"promo|sponsor(ed)?|advert(isement)?s?|"
-    r"banner-ad|google-ad|adsbygoogle|ad[-_]slot|ad[-_]unit|"
-    r"site-logo|navbar-brand|brand-logo|"
-    r"search-widget|custom-search)\b",
-    re.IGNORECASE,
-)
-
-_AD_NETWORK_RE = re.compile(
-    r"(doubleclick|googlesyndication|googleadservices|adsystem|adnxs|"
-    r"taboola|outbrain|criteo|tiktok|pagead|gstatic\.com|"
-    r"google\.com/(?:logos|images)|trustrank)",
-    re.IGNORECASE,
-)
-
-
-def _is_chrome_or_ad(tag) -> bool:
-    """True if tag (or an ancestor) looks like site chrome, navigation, or an ad/widget —
-    i.e. NOT part of the actual business listing content."""
-    for el in [tag] + list(tag.parents):
-        if not hasattr(el, "name"):
-            continue
-        if el.name in _CHROME_TAGS:
-            return True
-        if hasattr(el, "get") and _CHROME_OR_AD_RE.search(_cls_str(el)):
-            return True
-    return False
-
-
-def _directory_brand(source: str) -> str:
-    """
-    Best-effort extraction of the directory site's own brand/short-name from
-    its domain, used to filter out the SITE's logo (e.g. 'gravitysplash' for
-    gravitysplash.com) from business-logo detection.
-    """
-    if not source:
-        return ""
-    labels = [p for p in source.lower().split(".") if p]
-    skip = {"www", "us", "app", "en", "m", "en-us"}
-    for label in labels:
-        if label in skip:
-            continue
-        if len(label) > 2:
-            return label
-    return labels[0] if labels else ""
 
 
 def _good_desc(text: str, min_len: int = 60) -> bool:
@@ -780,13 +745,7 @@ Changes vs original
    catching more real-world patterns.
 """
 
-def _universal_keywords(
-    soup,
-    business_name: str = "",
-    category: str = "",
-    city: str = "",
-    state: str = "",
-) -> str:  # noqa: C901
+def _universal_keywords(soup) -> str:  # noqa: C901
     """
     Keywords from:
       1. <meta name="keywords"> — highest priority, used verbatim
@@ -796,10 +755,6 @@ def _universal_keywords(
     - Never split multi-word tags on spaces (preserves "ChatGPT Ads Agency" intact)
     - "Location tags" sibling containers and sub-trees are excluded
     - Only comma, pipe, semicolon, or period used as tag separators
-    - business_name / category / city / state are passed through to
-      _clean_keywords() so that <meta name="keywords"> blobs (which often
-      mash together the business name + category + city) don't leak those
-      values into the final Keywords field.
     """
 
     # ── Shared patterns ────────────────────────────────────────────────────────
@@ -871,22 +826,7 @@ def _universal_keywords(
     if meta_kw:
         raw = meta_kw.get("content", "").strip()
         if raw:
-            cleaned_meta = _clean_keywords(
-                raw, business_name=business_name, category=category, city=city, state=state
-            )
-            if cleaned_meta:
-                # If the meta keywords blob reduces to a single token that is
-                # just the Category restated (e.g. <meta name="keywords"
-                # content="Water Damage Restoration"> on a page whose only
-                # other label is "Category: Water Damage Restoration"), don't
-                # treat that as a real keywords/tags list — fall through to
-                # the structural strategies below (which may find a genuine
-                # "Business tags" section, or find nothing → null).
-                single_tokens = [t.strip() for t in cleaned_meta.split(",") if t.strip()]
-                cat_norm = category.lower().strip()
-                if not (len(single_tokens) == 1 and cat_norm
-                        and single_tokens[0].lower().strip() == cat_norm):
-                    return cleaned_meta
+            return _clean_keywords(raw)
 
     # ── Strategy A: "Business tags" heading → walk NEXT siblings only ─────────
     #
@@ -936,7 +876,7 @@ def _universal_keywords(
                 break  # consume only the first non-empty content sibling
 
         if collected:
-            result = _clean_keywords(", ".join(collected), business_name=business_name, category=category, city=city, state=state)
+            result = _clean_keywords(", ".join(collected))
             if result:
                 return result
 
@@ -947,7 +887,7 @@ def _universal_keywords(
                 items = _collect_tag_items(parent, exclude_location_subtrees=True)
                 items = [i for i in items if i.lower() != label_txt.lower()]
                 if items:
-                    result = _clean_keywords(", ".join(items), business_name=business_name, category=category, city=city, state=state)
+                    result = _clean_keywords(", ".join(items))
                     if result:
                         return result
 
@@ -968,7 +908,7 @@ def _universal_keywords(
             continue
         items = _collect_tag_items(container, exclude_location_subtrees=True)
         if items:
-            result = _clean_keywords(", ".join(items), business_name=business_name, category=category, city=city, state=state)
+            result = _clean_keywords(", ".join(items))
             if result:
                 return result
 
@@ -988,7 +928,7 @@ def _universal_keywords(
         if m:
             raw = m.group(1).strip()
             parts = [p.strip() for p in re.split(r"[,|;.]", raw) if p.strip()]
-            cleaned = _clean_keywords(", ".join(parts), business_name=business_name, category=category, city=city, state=state)
+            cleaned = _clean_keywords(", ".join(parts))
             if cleaned:
                 return cleaned
 
@@ -1003,7 +943,7 @@ def _universal_keywords(
             if len(raw.split()) > 20:      # skip if it looks like a paragraph
                 continue
             parts = [p.strip() for p in re.split(r"[,|;.]", raw) if p.strip()]
-            cleaned = _clean_keywords(", ".join(parts), business_name=business_name, category=category, city=city, state=state)
+            cleaned = _clean_keywords(", ".join(parts))
             if cleaned:
                 return cleaned
 
@@ -1039,7 +979,7 @@ def _universal_keywords(
                     items = [p.strip() for p in re.split(r"[,|;.]", sib_txt)
                              if p.strip()]
                 if items:
-                    cleaned = _clean_keywords(", ".join(items), business_name=business_name, category=category, city=city, state=state)
+                    cleaned = _clean_keywords(", ".join(items))
                     if cleaned:
                         return cleaned
             break
@@ -1071,20 +1011,15 @@ def _universal_email(soup) -> str:
 #  Universal visual detectors (logo / photos)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _detect_logo(soup, structured: dict, source: str = "") -> bool:
+def _detect_logo(soup, structured: dict) -> bool:
     if structured.get("logo_url"):
         return True
-
-    brand = _directory_brand(source)
 
     tag = soup.find(attrs={"itemprop": "image"})
     if tag:
         src = tag.get("src", tag.get("content", ""))
         if src and src.startswith("http") and not _is_tiny(tag, 20):
             return True
-
-    content_logo_candidates = []  # images with explicit logo signals in src/class/alt
-    fallback_candidates = []      # any non-trivial non-ad content-area image
 
     for img in soup.find_all("img"):
         srcs = _all_srcs(img)
@@ -1100,150 +1035,19 @@ def _detect_logo(soup, structured: dict, source: str = "") -> bool:
 
         if _is_tiny(img, 20) or _UI_IMAGE_PATTERNS.search(src):
             continue
-        if _AD_NETWORK_RE.search(src) or _AD_NETWORK_RE.search(parent_cls):
-            continue
-        if brand and (brand in src.lower() or brand in cls
-                       or brand in parent_cls.lower() or brand in alt):
-            continue
 
-        # Strong signal: src/class/alt explicitly says "logo"
         if (_LOGO_SIGNALS.search(src) or _LOGO_SIGNALS.search(cls)
                 or _LOGO_SIGNALS.search(parent_cls)
                 or re.search(r"\b(logo|brand|emblem)\b", alt)):
-            content_logo_candidates.append(src)
-            continue
-
-        # Skip pure site-chrome (nav/header/footer) for the fallback bucket only
-        if _is_chrome_or_ad(img):
-            continue
-
-        # Fallback: any remaining non-trivial content-area image
-        fallback_candidates.append(src)
-
-    if content_logo_candidates:
-        return True
-
-    # Fallback: if there is at least one non-trivial content-area image that
-    # passed all filters, treat it as the business logo.  Many simple directory
-    # listings (e.g. askmap.net) display the logo as a plain <img> with no
-    # "logo" keyword anywhere in its markup.
-    if fallback_candidates:
-        return True
+            return True
 
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Reference-logo matching (hardcoded business logo → exact-match detection)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _collect_logo_candidate_urls(soup, structured: dict, source: str = "") -> list:
-    """
-    Collect candidate image URLs that MIGHT be the business's logo, in
-    priority order. These are then checked against the user's reference
-    logo via perceptual hashing (logo_matcher) — only an actual match
-    counts, so it's fine (and better) to be generous here.
-    """
-    candidates = []
-
-    def _add(url):
-        if url and url not in candidates:
-            candidates.append(url)
-
-    # Highest priority: structured data (JSON-LD logo, og:image, itemprop image)
-    if structured.get("logo_url"):
-        _add(structured["logo_url"])
-    for url in structured.get("image_urls", []):
-        _add(url)
-
-    tag = soup.find(attrs={"itemprop": "image"})
-    if tag:
-        _add(tag.get("src", tag.get("content", "")))
-
-    # Collect ALL <img> elements — every src variant (src, data-src, srcset, etc.)
-    # is included so no image is ever skipped.  The only filter applied here is
-    # the ad-network RE, which blocks known tracking pixels and ad-serving URLs
-    # that would never be a business logo.  All other filtering (tiny size,
-    # site-chrome, directory branding) is intentionally removed because the
-    # perceptual-hash comparison against the reference logo is the real filter:
-    # an image that doesn't match the reference simply doesn't contribute to the
-    # result, so being maximally inclusive here costs only a few extra downloads
-    # while preventing false-negative misses when the logo appears in an
-    # unexpected DOM location.
-    for img in soup.find_all("img"):
-        all_img_srcs = _all_srcs(img)
-        if not all_img_srcs:
-            continue
-        parent_cls = " ".join(
-            _cls_str(p) for p in img.parents
-            if hasattr(p, "get") and p.name not in ("html", "body")
-        )[:300]
-        for src in all_img_srcs:
-            if _AD_NETWORK_RE.search(src) or _AD_NETWORK_RE.search(parent_cls):
-                continue
-            _add(src)
-
-    # Also collect CSS background-image URLs — some directories display the
-    # business logo as a background-image on a <div> rather than an <img>.
-    import re as _re
-    for tag in soup.find_all(style=True):
-        bg_urls = _re.findall(
-            r"background(?:-image)?\s*:\s*url\(['\"]?([^'\"\)]+)['\"]?\)",
-            tag.get("style", ""), _re.IGNORECASE,
-        )
-        for bg_url in bg_urls:
-            bg_url = bg_url.strip()
-            if bg_url and not bg_url.startswith("data:"):
-                if not _AD_NETWORK_RE.search(bg_url):
-                    _add(bg_url)
-
-    return candidates
-
-
-def _detect_logo_by_reference(
-    soup, structured: dict, source: str, page_url: str, logo_ref_hashes: dict
-) -> tuple:
-    """
-    Logo is PRESENT only if one of the candidate images on the page
-    perceptually matches the user's uploaded reference logo.
-
-    Returns (matched: bool, debug: dict) where debug includes the list of
-    candidate URLs checked, whether each was downloadable, and the best
-    Hamming distance found (lower = more similar; a match requires
-    distance <= logo_matcher.DEFAULT_THRESHOLD).
-    """
-    import logo_matcher
-
-    candidates = _collect_logo_candidate_urls(soup, structured, source)
-    if not candidates:
-        return False, {"candidates_found": 0, "checked": []}
-
-    match, checked = logo_matcher.find_matching_image_debug(
-        candidates, logo_ref_hashes, page_url=page_url
-    )
-    debug = {
-        "candidates_found": len(candidates),
-        "threshold": logo_matcher.DEFAULT_THRESHOLD,
-        "matched_url": match,
-        "checked": checked,
-    }
-    return match is not None, debug
-
-
-def _detect_photos(soup, structured: dict, source: str = "") -> bool:
-    brand = _directory_brand(source)
-
-    def _is_own_brand_or_ad(url: str) -> bool:
-        ul = url.lower()
-        if _AD_NETWORK_RE.search(ul):
-            return True
-        if brand and brand in ul:
-            return True
-        return False
-
+def _detect_photos(soup, structured: dict) -> bool:
     if len(structured.get("image_urls", [])) >= 1:
         for url in structured["image_urls"]:
-            if not _UI_IMAGE_PATTERNS.search(url) and not _is_own_brand_or_ad(url):
+            if not _UI_IMAGE_PATTERNS.search(url):
                 return True
 
     hero_re = re.compile(
@@ -1254,32 +1058,25 @@ def _detect_photos(soup, structured: dict, source: str = "") -> bool:
     for container in soup.find_all(["div", "section", "ul", "figure", "header"]):
         if not hero_re.search(_cls_str(container)):
             continue
-        if _is_chrome_or_ad(container):
-            continue
         for img in container.find_all("img"):
             srcs = _all_srcs(img)
-            if srcs and not _is_tiny(img, 40) and not _UI_IMAGE_PATTERNS.search(srcs[0]) \
-                    and not _is_own_brand_or_ad(srcs[0]):
+            if srcs and not _is_tiny(img, 40) and not _UI_IMAGE_PATTERNS.search(srcs[0]):
                 return True
         style = container.get("style", "")
         if "background" in style.lower() and "url(" in style.lower():
             return True
 
     for tag in soup.find_all(style=True):
-        if _is_chrome_or_ad(tag):
-            continue
         style_val = tag.get("style", "")
         bg_urls = re.findall(
             r"background(?:-image)?\s*:\s*url\(['\"]?([^'\"\)]+)['\"]?\)",
             style_val, re.IGNORECASE,
         )
         for url in bg_urls:
-            if url.strip() and not _UI_IMAGE_PATTERNS.search(url) and not _is_own_brand_or_ad(url):
+            if url.strip() and not _UI_IMAGE_PATTERNS.search(url):
                 return True
 
     for a in soup.find_all("a", href=True):
-        if _is_chrome_or_ad(a):
-            continue
         txt = a.get_text(strip=True).lower()
         href = a.get("href", "").lower()
         if txt in ("photos", "photo", "gallery", "images") or "photo" in href:
@@ -1295,8 +1092,6 @@ def _detect_photos(soup, structured: dict, source: str = "") -> bool:
         if _UI_IMAGE_PATTERNS.search(src) or _is_tiny(img, 60):
             continue
         if any(x in src.lower() for x in ("favicon", "sprite", "icon-", "-icon")):
-            continue
-        if _is_chrome_or_ad(img) or _is_own_brand_or_ad(src):
             continue
         large_count += 1
         if large_count >= 2:
@@ -1337,41 +1132,15 @@ _US_STATE_RE = re.compile(
 )
 
 
-def _clean_keywords(
-    raw: str,
-    business_name: str = "",
-    category: str = "",
-    city: str = "",
-    state: str = "",
-) -> str:
-    """
-    Clean a raw keyword/tag string.
-
-    Splits on comma, pipe, or semicolon only (never spaces, to preserve
-    multi-word tags). Drops tokens that are:
-      - address-like / zip codes / bare state names or abbreviations
-      - generic map/location noise
-      - the business name itself (exact match)
-      - the business's own city or state (exact match) — these are
-        "Location tags", not keywords
-
-    `category` is accepted for signature symmetry with callers but is not
-    used to filter individual tokens here — see _universal_keywords()'s
-    <meta name="keywords"> handling for the Category-duplicate guard.
-
-    If, after filtering, nothing distinctive remains, returns "".
-    """
+def _clean_keywords(raw: str, business_name: str = "") -> str:
     if not raw:
         return ""
     # Split on comma, pipe, or semicolon only — never on spaces
     tokens = [t.strip() for t in re.split(r"[,|;]", raw) if t.strip()]
-    bn_lower    = business_name.lower().strip()
-    cat_lower   = category.lower().strip()
-    city_lower  = city.lower().strip()
-    state_lower = state.lower().strip()
+    bn_lower = business_name.lower().strip()
     cleaned = []
     for tok in tokens:
-        tl = tok.lower().strip()
+        tl = tok.lower()
         if _ADDRESS_TOKEN_RE.match(tok):
             continue
         if _KW_NOISE_RE.match(tok):
@@ -1387,14 +1156,7 @@ def _clean_keywords(
             continue
         if re.match(r"^\d{5}(-\d{4})?$", tok):
             continue
-        # Drop the business name itself
         if bn_lower and tl == bn_lower:
-            continue
-        # Drop the business's own city / state (these are location tags,
-        # not keywords — e.g. brownbook's "Location tags" column)
-        if city_lower and tl == city_lower:
-            continue
-        if state_lower and tl == state_lower:
             continue
         cleaned.append(tok)
     return ", ".join(cleaned)
@@ -1473,13 +1235,7 @@ def _parse_url_slug(url: str) -> dict:
 #  Master pre-extraction (universal — no domain routing)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_page_hints(
-    page_html: str,
-    page_text: str,
-    source: str = "",
-    page_url: str = "",
-    logo_ref_hashes: dict = None,
-) -> dict:
+def _extract_page_hints(page_html: str, page_text: str, source: str = "") -> dict:
     """
     Single universal extraction pass.
     Returns a hints dict consumed by build_prompt and post-processing.
@@ -1537,23 +1293,11 @@ def _extract_page_hints(
         hints["social"]      = _universal_social(soup)
         hints["gbp"]         = _universal_gbp(soup)
         hints["category"]    = structured["category"] or _universal_category(soup)
-        hints["keywords"]    = _universal_keywords(
-            soup,
-            business_name=hints.get("name", ""),
-            category=hints.get("category", ""),
-            city=hints.get("city", ""),
-            state=hints.get("state", ""),
-        )
+        hints["keywords"]    = _universal_keywords(soup)
 
         # 4. Visual detection
-        if logo_ref_hashes:
-            logo_matched, _logo_debug = _detect_logo_by_reference(
-                soup, structured, source, page_url, logo_ref_hashes
-            )
-            hints["logo_confirmed"] = logo_matched
-        else:
-            hints["logo_confirmed"] = _detect_logo(soup, structured, source)
-        hints["photos_confirmed"] = _detect_photos(soup, structured, source)
+        hints["logo_confirmed"]   = _detect_logo(soup, structured)
+        hints["photos_confirmed"] = _detect_photos(soup, structured)
 
     except Exception:
         pass
@@ -1565,15 +1309,8 @@ def _extract_page_hints(
 #  Prompt builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_prompt(
-    page_text: str,
-    page_html: str,
-    fields: list,
-    source: str = "",
-    page_url: str = "",
-    logo_ref_hashes: dict = None,
-) -> str:
-    hints = _extract_page_hints(page_html, page_text, source, page_url, logo_ref_hashes)
+def build_prompt(page_text: str, page_html: str, fields: list, source: str = "") -> str:
+    hints = _extract_page_hints(page_html, page_text, source)
 
     if hints.get("cloudflare_blocked"):
         return (
@@ -1586,20 +1323,8 @@ def build_prompt(
 
     facts = []
 
-    if logo_ref_hashes:
-        if hints["logo_confirmed"]:
-            facts.append(
-                'REFERENCE LOGO MATCH FOUND on this page — return "PRESENT" for Logo'
-            )
-        else:
-            facts.append(
-                'REFERENCE LOGO PROVIDED but NO MATCHING IMAGE found on this page — '
-                'return null for Logo (this is authoritative; do not guess "PRESENT" '
-                'based on other images)'
-            )
-    elif hints["logo_confirmed"]:
+    if hints["logo_confirmed"]:
         facts.append('LOGO CONFIRMED PRESENT — return "PRESENT" for Logo')
-
     if hints["photos_confirmed"]:
         facts.append('PHOTOS CONFIRMED PRESENT — return "PRESENT" for Photos')
 
@@ -1681,14 +1406,10 @@ def build_prompt(
             field_rules.append('- "Category": business type or industry. Use PRE-EXTRACTED if present.')
         elif f == "Keywords":
             field_rules.append(
-                '- "Keywords": a dedicated tags/keywords list — NOT the same thing as Category.\n'
-                '  Use KEYWORDS from PRE-EXTRACTED FIELDS verbatim if present.\n'
-                '  Otherwise look ONLY for an explicit "Tags", "Keywords", or "Business tags"\n'
-                '  section, or pipe/comma-separated label list (e.g. "AI | Legal | Law").\n'
-                '  Do NOT invent Keywords from the Category, business name, page title,\n'
-                '  or address/city/state. If the page has no distinct tags/keywords section\n'
-                '  separate from Category, return null — do NOT repeat the Category value\n'
-                '  (or the business name, or the city/state) as Keywords.'
+                '- "Keywords": any tags, keywords, or labels associated with the business. '
+                'These may appear as pipe-separated values (e.g. "AI | Legal | Law"), '
+                'comma-separated tags, or a labeled section like "Keywords" or "Tags". '
+                'Return comma-separated.'
             )
         elif f == "Description":
             field_rules.append(
@@ -1749,7 +1470,7 @@ CRITICAL RULES:
 - Logo/Photos: if PRE-EXTRACTED confirms PRESENT, return "PRESENT" — do not second-guess.
 - Website URL: NEVER return a cloudflare.com URL.
 - Hours: NEVER return "00:00 to 00:00" placeholders — return null instead.
-- Keywords: use KEYWORDS from PRE-EXTRACTED FIELDS verbatim if present. Otherwise search the page for an explicit "Tags"/"Keywords"/"Business tags" section or pipe/comma-separated label list and return comma-separated. NEVER return the Category value, business name, or city/state as Keywords — if no distinct tags section exists, return null.
+- Keywords: use KEYWORDS from PRE-EXTRACTED FIELDS verbatim if present. Otherwise search the page for "Tags", "Keywords", or pipe/comma-separated label sections and return comma-separated.
 - Name: NEVER return a website domain (e.g. "nearfinderus.com") as the business name.
 
 FIELD INSTRUCTIONS:
@@ -1819,16 +1540,10 @@ def _all_null(extracted: dict, fields: list) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_fields(
-    page_text: str,
-    page_html: str,
-    fields: list,
-    source: str,
-    api_key: str,
-    page_url: str = "",
-    logo_ref_hashes: dict = None,
+    page_text: str, page_html: str, fields: list, source: str, api_key: str
 ) -> dict:
     client = genai.Client(api_key=api_key)
-    prompt = build_prompt(page_text, page_html, fields, source, page_url, logo_ref_hashes)
+    prompt = build_prompt(page_text, page_html, fields, source)
 
     raw = ""
     model_used = ""
@@ -1855,7 +1570,7 @@ def extract_fields(
         extracted["_model"] = model_used
 
         # ── Post-process: enforce authoritative hints ──────────────────────
-        hints = _extract_page_hints(page_html, page_text, source, page_url, logo_ref_hashes)
+        hints = _extract_page_hints(page_html, page_text, source)
 
         if hints.get("cloudflare_blocked"):
             for f in fields:
@@ -1868,13 +1583,8 @@ def extract_fields(
             return v in (None, "", "null", "None")
 
         # Visual fields
-        if "Logo" in fields:
-            if logo_ref_hashes:
-                # Reference logo provided — exact-match result is authoritative
-                # in BOTH directions (overrides whatever Gemini guessed).
-                extracted["Logo"] = "PRESENT" if hints["logo_confirmed"] else None
-            elif hints["logo_confirmed"]:
-                extracted["Logo"] = "PRESENT"
+        if hints["logo_confirmed"] and "Logo" in fields:
+            extracted["Logo"] = "PRESENT"
         if hints["photos_confirmed"] and "Photos" in fields:
             extracted["Photos"] = "PRESENT"
 
@@ -1901,12 +1611,10 @@ def extract_fields(
                     extracted[field_name] = hints[hint_key]
 
         # Keywords: use pre-extracted hint as fallback if Gemini returned empty
-        # (hints["keywords"] is already cleaned via _universal_keywords, which
-        # was called with business_name/category/city/state context)
         if "Keywords" in fields:
             kw_hint = hints.get("keywords", "")
             if _empty(extracted.get("Keywords")) and kw_hint:
-                extracted["Keywords"] = kw_hint
+                extracted["Keywords"] = _clean_keywords(kw_hint) or None
 
         # ── Final guards ───────────────────────────────────────────────────
 
@@ -1957,23 +1665,11 @@ def extract_fields(
                         else None
                     )
 
-        # Keywords: clean whatever remains — strip business name, category,
-        # and city/state from any meta-keywords-style blob (the structural
-        # "Business tags" / "Tags" extraction in _universal_keywords already
-        # excludes Category-only single-token results — see Priority 1 there).
+        # Keywords: clean whatever remains
         if "Keywords" in fields:
             kw_val = extracted.get("Keywords", "") or ""
-            if _empty(kw_val):
-                extracted["Keywords"] = None
-            else:
-                bn  = extracted.get("Name", "") or ""
-                cat = extracted.get("Category", "") or ""
-                cty = extracted.get("City", "") or ""
-                st  = extracted.get("State", "") or ""
-                cleaned_kw = _clean_keywords(
-                    kw_val, business_name=bn, category=cat, city=cty, state=st
-                )
-                extracted["Keywords"] = cleaned_kw or None
+            if kw_val:
+                extracted["Keywords"] = _clean_keywords(kw_val) or None
 
         # All-null fallback: try URL slug
         if _all_null(extracted, fields) and source:
@@ -1993,12 +1689,9 @@ def extract_fields(
     except json.JSONDecodeError as e:
         extracted = {"_parse_error": str(e), "_raw": raw[:800], "_model": model_used}
         try:
-            hints = _extract_page_hints(page_html, page_text, source, page_url, logo_ref_hashes)
-            if "Logo" in fields:
-                if logo_ref_hashes:
-                    extracted["Logo"] = "PRESENT" if hints["logo_confirmed"] else None
-                elif hints["logo_confirmed"]:
-                    extracted["Logo"] = "PRESENT"
+            hints = _extract_page_hints(page_html, page_text, source)
+            if hints["logo_confirmed"] and "Logo" in fields:
+                extracted["Logo"] = "PRESENT"
             if hints["photos_confirmed"] and "Photos" in fields:
                 extracted["Photos"] = "PRESENT"
         except Exception:
@@ -2015,7 +1708,6 @@ def extract_batch(
     source: str,
     api_key: str,
     progress_callback=None,
-    logo_ref_hashes: dict = None,
 ) -> list:
     from scraper import clean_html, clean_text
 
@@ -2034,9 +1726,7 @@ def extract_batch(
                 cleaned_text = f"PAGE TITLE: {title}\n\n{cleaned_text}"
 
             result = extract_fields(
-                cleaned_text, cleaned_html, fields, source, api_key,
-                page_url=page.get("url", ""),
-                logo_ref_hashes=logo_ref_hashes,
+                cleaned_text, cleaned_html, fields, source, api_key
             )
 
         result["_url"] = page["url"]
