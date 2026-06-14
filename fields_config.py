@@ -45,12 +45,7 @@ SOURCE_FIELDS = {
         "Phone",	"Website URL",	"Keywords",	"Description", "Hours",
         "Category",	"Logo"
     ],
-    "callupcontact.com":[
-        "Name", "Street", "City", "State", "Zipcode", "Country",
-    "Phone", "Website URL", "Keywords", "Description",
-    "Hours", "Social Media Links", "GBP Link", "Business Email",
-    "Category", "Logo", "Photos",
-    ],
+    
 }
 
 VISUAL_FIELDS = {"Logo", "Photos"}
