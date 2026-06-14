@@ -24,24 +24,12 @@ BLOCK_SIGNALS = [
     "security check", "access to this page has been denied",
 ]
 
-# Minimum meaningful text length per domain. Pages below this threshold
-# are considered incomplete (e.g. only a cookie banner was captured).
-DOMAIN_MIN_CHARS = {
-    "askmap.net": 800,
-}
-
 def _is_blocked(html, text):
     combined = (html[:3000] + text[:1000]).lower()
     return any(s in combined for s in BLOCK_SIGNALS)
 
-def _is_thin(text, url="", min_chars=200):
-    threshold = min_chars
-    url_lower = url.lower()
-    for domain, domain_min in DOMAIN_MIN_CHARS.items():
-        if domain in url_lower:
-            threshold = domain_min
-            break
-    return len(text.strip()) < threshold
+def _is_thin(text, min_chars=200):
+    return len(text.strip()) < min_chars
 
 async def scrape(url, timeout):
     from playwright.async_api import async_playwright
@@ -67,34 +55,6 @@ async def scrape(url, timeout):
                     result["debug"] = f"goto failed: {e}"
                     await browser.close()
                     return result
-
-            # ── Dismiss cookie/consent banners before scrolling ────────────
-            # askmap.net and similar sites show a cookie consent overlay that
-            # must be dismissed before images and full content load.
-            # We try up to 3 times with a short wait between attempts.
-            for _attempt in range(3):
-                clicked = await page.evaluate("""() => {
-                    const acceptTexts = [
-                        'i agree', 'accept', 'accept all', 'allow all',
-                        'got it', 'ok', 'okay', 'agree', 'accept cookies',
-                        'allow cookies', 'consent', 'close',
-                    ];
-                    const els = document.querySelectorAll(
-                        'a, button, input[type="button"], input[type="submit"]'
-                    );
-                    for (const el of els) {
-                        const txt = (el.innerText || el.value || '').toLowerCase().trim();
-                        if (acceptTexts.includes(txt)) {
-                            try { el.click(); return true; } catch(e) {}
-                        }
-                    }
-                    return false;
-                }""")
-                if clicked:
-                    # Wait for page to fully re-render after banner dismissal
-                    await page.wait_for_timeout(3000)
-                    break
-                await page.wait_for_timeout(1000)
 
             # ── Scroll entire page to trigger lazy-loaded images and content ──
             await page.wait_for_timeout(2000)
@@ -165,7 +125,7 @@ async def scrape(url, timeout):
             if _is_blocked(html, text):
                 result["debug"] = "Playwright: blocked/CAPTCHA"
                 return result
-            if _is_thin(text, url):
+            if _is_thin(text):
                 result["debug"] = f"Playwright: too thin ({len(text.strip())} chars)"
                 return result
 
