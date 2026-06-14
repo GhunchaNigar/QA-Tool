@@ -26,15 +26,10 @@ JS_RENDER_FIRST_DOMAINS = [
     "hotfrog.com",
     "smallbusinessusa.com",
     "brownbook.net",
-    "nextbizmaker.com",
-    "surfyourtown.com",
-    "zumvu.com",
-    "provenexpert.com",
-    "foursquare.com",
-    "askmap.net",
 ]
 
 STATIC_DOMAINS = [
+    "askmap.net",
     "freelistingusa.com",
 ]
 
@@ -67,43 +62,10 @@ JS_RENDER_CONFIG = {
         "wait_for_selector": "h1",
         "playwright_timeout": 45000,
     },
-    "nextbizmaker.com": {
-        "wait": "15000",
-        "wait_for_selector": "body",
-        "playwright_timeout": 45000,
-    },
-    "surfyourtown.com": {
-        "wait": "15000",
-        "wait_for_selector": "body",
-        "playwright_timeout": 45000,
-    },
-    "zumvu.com": {
-        "wait": "15000",
-        "wait_for_selector": "body",
-        "playwright_timeout": 45000,
-    },
-    "provenexpert.com": {
-        "wait": "15000",
-        "wait_for_selector": "body",
-        "playwright_timeout": 45000,
-    },
-    "foursquare.com": {
-        # Heavily bot-protected — go straight to premium rendering
-        "wait": "20000",
-        "wait_for_selector": "body",
-        "premium_first": True,
-        "playwright_timeout": 55000,
-    },
-    "askmap.net": {
-        # Needs JS render to load images; cookie banner must be dismissed first
-        "wait": "8000",
-        "wait_for_selector": "h1",
-        "playwright_timeout": 45000,
-    },
 }
 
 DOMAIN_MIN_CHARS = {
-    "askmap.net":          800,
+    "askmap.net":          150,
     "freelistingusa.com":  100,
     "smallbusinessusa.com": 150,
 }
@@ -114,20 +76,6 @@ DOMAIN_HEADERS = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     },
 }
-
-
-# ── URL cleanup ────────────────────────────────────────────────────────────────
-
-def _clean_scrape_url(url: str) -> str:
-    """
-    Some directories serve a stripped-down preview/widget when a particular
-    query string is present. Strip those before fetching so we get the full
-    profile page (the result's 'url' key in scrape_batch/scrape_page still
-    reflects the original URL for matching purposes).
-    """
-    if "provenexpert.com" in url.lower() and "?" in url:
-        return url.split("?")[0]
-    return url
 
 
 # ── Attempt order ─────────────────────────────────────────────────────────────
@@ -249,7 +197,6 @@ def _scraperapi_fetch(url: str, api_key: str, render: bool,
                       premium: bool = False, timeout: int = 90):
     from urllib.parse import quote, urlencode
 
-    url = _clean_scrape_url(url)
     encoded_url = quote(url, safe="")
     qs = {
         "api_key":      api_key,
@@ -344,7 +291,6 @@ def _scrape_via_playwright(url: str, timeout_ms: int = 45000) -> dict:
     import sys
     import os
 
-    url = _clean_scrape_url(url)
     url_lower = url.lower()
     for domain, cfg in JS_RENDER_CONFIG.items():
         if domain in url_lower:
