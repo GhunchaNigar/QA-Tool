@@ -6,3 +6,5 @@ openpyxl
 playwright
 pycountry
 google-genai
+Pillow
+ImageHash
