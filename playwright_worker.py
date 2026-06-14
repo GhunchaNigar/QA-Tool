@@ -56,6 +56,28 @@ async def scrape(url, timeout):
                     await browser.close()
                     return result
 
+            # ── Dismiss cookie/consent banners before scrolling ────────────
+            # Many directories (e.g. askmap.net) block image loading behind a
+            # cookie consent banner. Click the accept button if one is present.
+            await page.evaluate("""() => {
+                const acceptTexts = [
+                    'i agree', 'accept', 'accept all', 'allow all',
+                    'got it', 'ok', 'okay', 'agree', 'accept cookies',
+                    'allow cookies', 'consent', 'close',
+                ];
+                const els = document.querySelectorAll(
+                    'a, button, input[type="button"], input[type="submit"]'
+                );
+                for (const el of els) {
+                    const txt = (el.innerText || el.value || '').toLowerCase().trim();
+                    if (acceptTexts.includes(txt)) {
+                        try { el.click(); } catch(e) {}
+                        break;
+                    }
+                }
+            }""")
+            await page.wait_for_timeout(1500)
+
             # ── Scroll entire page to trigger lazy-loaded images and content ──
             await page.wait_for_timeout(2000)
             await page.evaluate("""async () => {
