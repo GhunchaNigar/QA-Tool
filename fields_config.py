@@ -45,7 +45,86 @@ SOURCE_FIELDS = {
         "Phone",	"Website URL",	"Keywords",	"Description", "Hours",
         "Category",	"Logo"
     ],
-    
+
+    # ── New sources (default field set — adjust per-site once verified) ──────
+    "callupcontact.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "zeemaps.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "place123.net": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "foursquare.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "earthmom.org": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "gravitysplash.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "webforcompany.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "provenexpert.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "thelocal.directory": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "nextbizmaker.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "surfyourtown.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "zumvu.com": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
+    "blinx.biz": [
+        "Name", "Street", "City", "State", "Zipcode", "Country",
+        "Phone", "Website URL", "Keywords", "Description",
+        "Hours", "Social Media Links", "Business Email",
+        "Category", "Logo", "Photos",
+    ],
 }
 
 VISUAL_FIELDS = {"Logo", "Photos"}
