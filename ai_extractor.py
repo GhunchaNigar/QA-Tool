@@ -1173,18 +1173,32 @@ def _collect_logo_candidate_urls(soup, structured: dict, source: str = "") -> li
 
 def _detect_logo_by_reference(
     soup, structured: dict, source: str, page_url: str, logo_ref_hashes: dict
-) -> bool:
+) -> tuple:
     """
     Logo is PRESENT only if one of the candidate images on the page
     perceptually matches the user's uploaded reference logo.
+
+    Returns (matched: bool, debug: dict) where debug includes the list of
+    candidate URLs checked, whether each was downloadable, and the best
+    Hamming distance found (lower = more similar; a match requires
+    distance <= logo_matcher.DEFAULT_THRESHOLD).
     """
     import logo_matcher
 
     candidates = _collect_logo_candidate_urls(soup, structured, source)
     if not candidates:
-        return False
-    match = logo_matcher.find_matching_image(candidates, logo_ref_hashes, page_url=page_url)
-    return match is not None
+        return False, {"candidates_found": 0, "checked": []}
+
+    match, checked = logo_matcher.find_matching_image_debug(
+        candidates, logo_ref_hashes, page_url=page_url
+    )
+    debug = {
+        "candidates_found": len(candidates),
+        "threshold": logo_matcher.DEFAULT_THRESHOLD,
+        "matched_url": match,
+        "checked": checked,
+    }
+    return match is not None, debug
 
 
 def _detect_photos(soup, structured: dict, source: str = "") -> bool:
