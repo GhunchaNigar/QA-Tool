@@ -1,18 +1,3 @@
-"""
-app.py
-Business Listing Checker — Streamlit UI.
-
-Flow:
-  1. User fills in their business data (all fields, one form).
-  2. User pastes URLs (any mix of supported directories).
-  3. App auto-detects the source for each URL from SOURCE_FIELDS keys.
-  4. Each URL is scraped, AI-extracted, then compared against only the
-     fields defined for its detected source.
-  5. A single Excel report is produced covering all URLs / sources.
-
-Run with:  streamlit run app.py
-"""
-
 import streamlit as st
 from fields_config import ALL_FIELDS, SOURCE_FIELDS, VISUAL_FIELDS, detect_source
 from scraper import scrape_batch
@@ -21,7 +6,7 @@ from comparator import compare_all
 from excel_writer import write_excel, make_filename
 import subprocess, sys
 
-subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], 
+subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
                capture_output=True)
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -54,6 +39,14 @@ st.markdown("""
         font-size: 0.78rem; font-weight: 600;
         margin: 2px 3px;
     }
+    .category-label {
+        font-size: 0.875rem; font-weight: 600;
+        margin-bottom: 0.4rem; color: inherit;
+    }
+    .category-hint {
+        font-size: 0.78rem; color: #888;
+        margin-bottom: 0.6rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -81,50 +74,68 @@ st.markdown(
 )
 
 user_data = {}
+
+# Fields that get special treatment — excluded from the generic 3-col grid
+CATEGORY_FIELD = "Category"
+TEXTAREA_FIELDS = ("Description", "Keywords", "Hours", "Social Media Links", "GBP Link")
+
+# All fields except Category go into the standard 3-column grid
+fields_for_grid = [f for f in ALL_FIELDS if f != CATEGORY_FIELD]
+
 COLS = 3
-chunks = [ALL_FIELDS[i:i+COLS] for i in range(0, len(ALL_FIELDS), COLS)]
+chunks = [fields_for_grid[i:i + COLS] for i in range(0, len(fields_for_grid), COLS)]
 
 for chunk in chunks:
     cols = st.columns(COLS)
     for i, field in enumerate(chunk):
         with cols[i]:
-            if field == "Category":
-                st.markdown(f"**{field}**")
-                cat_vals = []
-                prev = st.session_state.user_data.get(field, "")
-                prev_parts = [p.strip() for p in prev.split("|")] + ["", "", "", ""]
-                for ci in range(4):
-                    cat_vals.append(
-                        st.text_input(
-                            f"Category {ci + 1}",
-                            key=f"field_{field}_{ci}",
-                            value=prev_parts[ci],
-                            label_visibility="collapsed" if ci > 0 else "visible",
-                            placeholder=f"Category {ci + 1}",
-                        )
-                    )
-                user_data[field] = " | ".join(v.strip() for v in cat_vals if v.strip())
-            elif field in VISUAL_FIELDS:
+            if field in VISUAL_FIELDS:
                 sel = st.selectbox(
                     field,
                     options=["Yes — should be present", "No — not required"],
                     key=f"field_{field}",
                 )
                 user_data[field] = "present" if "Yes" in sel else ""
-            elif field in ("Description", "Keywords", "Hours",
-                           "Social Media Links", "GBP Link"):
+
+            elif field in TEXTAREA_FIELDS:
                 user_data[field] = st.text_area(
                     field,
                     height=80,
                     key=f"field_{field}",
                     value=st.session_state.user_data.get(field, ""),
                 )
+
             else:
                 user_data[field] = st.text_input(
                     field,
                     key=f"field_{field}",
                     value=st.session_state.user_data.get(field, ""),
                 )
+
+# ── Category — full-width 4-column row ───────────────────────────────────────
+if CATEGORY_FIELD in ALL_FIELDS:
+    st.markdown(
+        '<div class="category-label">Category</div>'
+        '<div class="category-hint">Enter up to 4 categories — comparison passes if any one matches</div>',
+        unsafe_allow_html=True,
+    )
+    prev_cat = st.session_state.user_data.get(CATEGORY_FIELD, "")
+    prev_parts = [p.strip() for p in prev_cat.split("|")] + ["", "", "", ""]
+
+    cat_cols = st.columns(4)
+    cat_vals = []
+    placeholders = ["e.g. Plumber", "e.g. Contractor", "e.g. Home Services", "e.g. Renovation"]
+    for ci, col in enumerate(cat_cols):
+        with col:
+            cat_vals.append(
+                st.text_input(
+                    f"Category {ci + 1}",
+                    key=f"field_Category_{ci}",
+                    value=prev_parts[ci] if ci < len(prev_parts) else "",
+                    placeholder=placeholders[ci],
+                )
+            )
+    user_data[CATEGORY_FIELD] = " | ".join(v.strip() for v in cat_vals if v.strip())
 
 st.session_state.user_data = user_data
 st.markdown("---")
@@ -151,7 +162,6 @@ st.markdown("---")
 # ── STEP 3 — URLs ─────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header">③ Live Directory URLs</div>', unsafe_allow_html=True)
 
-# Supported directories — collapsed behind expander
 sorted_domains = sorted(SOURCE_FIELDS.keys())
 domain_badges_html = " ".join(
     f'<span class="source-badge">{d}</span>' for d in sorted_domains
@@ -172,12 +182,10 @@ links_text = st.text_area(
     ),
 )
 
-raw_links = [l.strip() for l in links_text.split("\n")
-             if l.strip().startswith("http")]
+raw_links = [l.strip() for l in links_text.split("\n") if l.strip().startswith("http")]
 
-# Classify each URL
-known_urls   = []
-unknown_urls = []
+known_urls     = []
+unknown_urls   = []
 url_source_map = {}
 
 for url in raw_links:
@@ -189,7 +197,6 @@ for url in raw_links:
         unknown_urls.append(url)
 
 if raw_links:
-    # Summary line
     summary_parts = [f"**{len(known_urls)} recognised**"]
     if unknown_urls:
         summary_parts.append(f"**{len(unknown_urls)} unknown**")
@@ -238,9 +245,9 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
         st.error("Please fill in at least one business data field.")
         st.stop()
 
-    status_box  = st.empty()
-    progress    = st.progress(0)
-    log_box     = st.empty()
+    status_box = st.empty()
+    progress   = st.progress(0)
+    log_box    = st.empty()
     log_lines: list = []
 
     def log(msg: str):
@@ -255,7 +262,7 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
         log(f"Starting scrape of {total} URLs (up to 5 concurrent)…")
         scraped = scrape_batch(known_urls, api_key=scraper_api_key, batch_size=5)
 
-        errors   = sum(1 for s in scraped if s.get("error"))
+        errors    = sum(1 for s in scraped if s.get("error"))
         scrape_ok = total - errors
         log(f"Scraping done — {scrape_ok} OK, {errors} failed.")
 
@@ -274,14 +281,13 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
         status_box.info("🤖 Extracting fields with Gemini…")
         log("Sending pages to Gemini for field extraction…")
 
-        # Group by source so each batch uses the right field set
         source_groups: dict = {}
         for page in scraped:
             src = url_source_map.get(page["url"], "unknown")
             source_groups.setdefault(src, []).append(page)
 
         all_extracted = []
-        done_count = [0]  # mutable container avoids nonlocal
+        done_count    = [0]
 
         for src, pages in source_groups.items():
             src_fields = SOURCE_FIELDS.get(src, ALL_FIELDS)
@@ -303,8 +309,8 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
 
         with st.expander("🤖 AI extraction debug"):
             for ex in all_extracted:
-                url = ex.get("_url", "")
-                src = url_source_map.get(url, "unknown")
+                url    = ex.get("_url", "")
+                src    = url_source_map.get(url, "unknown")
                 src_fields = SOURCE_FIELDS.get(src, [])
                 has_issues = any(
                     v is None or str(v).strip() in ("", "null", "None")
@@ -351,7 +357,7 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
         c3.metric("❌ Issues Found", incorrect)
 
         st.download_button(
-            label="Download Excel Report",
+            label="📥 Download Excel Report",
             data=excel_bytes,
             file_name=make_filename(user_data.get("Name", "")),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -365,9 +371,9 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
 
 elif run_disabled:
     hints = []
-    if not gemini_api_key:   hints.append("enter your Gemini API key")
-    if not scraper_api_key:  hints.append("enter your ScraperAPI key")
-    if not known_urls:       hints.append("paste at least one recognised directory URL")
+    if not gemini_api_key:  hints.append("enter your Gemini API key")
+    if not scraper_api_key: hints.append("enter your ScraperAPI key")
+    if not known_urls:      hints.append("paste at least one recognised directory URL")
     st.caption(f"Please {' and '.join(hints)} to enable analysis.")
 
 # ── Re-download previous results ──────────────────────────────────────────────
