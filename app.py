@@ -54,6 +54,7 @@ st.markdown("""
 for key, default in [
     ("user_data", {}),
     ("results", None),
+    ("analysis_payload", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -224,158 +225,55 @@ else:
 st.markdown("---")
 
 # ── STEP 4 — Run ──────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">④ Run Analysis & Download Report</div>',
-            unsafe_allow_html=True)
+st.markdown('<div class="section-header">④ Run Analysis</div>', unsafe_allow_html=True)
 
 run_disabled = not (known_urls and gemini_api_key and scraper_api_key)
 
 if st.button("Start Analysis", disabled=run_disabled, type="primary"):
+    # Validate inputs
+    error_msg = None
     if not gemini_api_key:
-        st.error("Please enter your Gemini API key.")
-        st.stop()
-    if not scraper_api_key:
-        st.error("Please enter your ScraperAPI key.")
-        st.stop()
-    if not known_urls:
-        st.error("No recognised directory URLs found.")
-        st.stop()
+        error_msg = "Please enter your Gemini API key."
+    elif not scraper_api_key:
+        error_msg = "Please enter your ScraperAPI key."
+    elif not known_urls:
+        error_msg = "No recognised directory URLs found."
+    elif not [f for f in ALL_FIELDS if user_data.get(f, "").strip()]:
+        error_msg = "Please fill in at least one business data field."
 
-    filled = [f for f in ALL_FIELDS if user_data.get(f, "").strip()]
-    if not filled:
-        st.error("Please fill in at least one business data field.")
-        st.stop()
+    if error_msg:
+        st.error(error_msg)
+    else:
+        # Store everything needed by the analysis page
+        st.session_state.analysis_payload = {
+            "user_data":      user_data,
+            "known_urls":     known_urls,
+            "url_source_map": url_source_map,
+            "gemini_api_key":  gemini_api_key,
+            "scraper_api_key": scraper_api_key,
+        }
+        st.switch_page("pages/analysis.py")
 
-    status_box = st.empty()
-    progress   = st.progress(0)
-    log_box    = st.empty()
-    log_lines: list = []
+elif run_disabled:
+    hints = []
+    if not gemini_api_key:  hints.append("enter your Gemini API key")
+    if not scraper_api_key: hints.append("enter your ScraperAPI key")
+    if not known_urls:      hints.append("paste at least one recognised directory URL")
+    st.caption(f"Please {' and '.join(hints)} to enable analysis.")
 
-    def log(msg: str):
-        log_lines.append(msg)
-        log_box.markdown("\n".join(f"- {l}" for l in log_lines[-8:]))
-
-    try:
-        total = len(known_urls)
-
-        # ── Stage 1: Scrape ───────────────────────────────────────────────
-        status_box.info(f"🌐 Scraping {total} page(s) via ScraperAPI…")
-        log(f"Starting scrape of {total} URLs (up to 5 concurrent)…")
-        scraped = scrape_batch(known_urls, api_key=scraper_api_key, batch_size=5)
-
-        errors    = sum(1 for s in scraped if s.get("error"))
-        scrape_ok = total - errors
-        log(f"Scraping done — {scrape_ok} OK, {errors} failed.")
-
-        with st.expander("🔍 Scrape debug info"):
-            for s in scraped:
-                icon = "✅" if not s.get("error") else "❌"
-                st.markdown(f"**{icon} {s['url']}**")
-                st.code(
-                    s.get("_debug", "").strip() or s.get("error", ""),
-                    language=None,
-                )
-
-        progress.progress(0.35)
-
-        # ── Stage 2: AI extraction (per-source fields) ────────────────────
-        status_box.info("🤖 Extracting fields with Gemini…")
-        log("Sending pages to Gemini for field extraction…")
-
-        source_groups: dict = {}
-        for page in scraped:
-            src = url_source_map.get(page["url"], "unknown")
-            source_groups.setdefault(src, []).append(page)
-
-        all_extracted = []
-        done_count    = [0]
-
-        for src, pages in source_groups.items():
-            src_fields = SOURCE_FIELDS.get(src, ALL_FIELDS)
-
-            def on_progress(done, total_count, _src=src, _dc=done_count):
-                _dc[0] += 1
-                pct = 0.35 + (_dc[0] / total) * 0.40
-                progress.progress(min(pct, 0.75))
-                log(f"[{_src}] extracted {done}/{total_count} pages…")
-
-            batch_result = extract_batch(
-                pages, src_fields, src, gemini_api_key,
-                progress_callback=on_progress,
-            )
-            all_extracted.extend(batch_result)
-
-        log("AI extraction complete.")
-        progress.progress(0.80)
-
-        with st.expander("🤖 AI extraction debug"):
-            for ex in all_extracted:
-                url    = ex.get("_url", "")
-                src    = url_source_map.get(url, "unknown")
-                src_fields = SOURCE_FIELDS.get(src, [])
-                has_issues = any(
-                    v is None or str(v).strip() in ("", "null", "None")
-                    for k, v in ex.items()
-                    if not k.startswith("_") and k in src_fields
-                )
-                icon      = "⚠️" if has_issues else "✅"
-                model_tag = f" `{ex.get('_model', '')}`" if ex.get("_model") else ""
-                repaired  = " _(JSON repaired)_" if ex.get("_repaired") else ""
-                st.markdown(f"**{icon} {url}** [{src}]{model_tag}{repaired}")
-                if ex.get("_parse_error") or ex.get("_error"):
-                    st.error(ex.get("_parse_error") or ex.get("_error"))
-                    if ex.get("_raw"):
-                        st.code(ex["_raw"], language=None)
-                else:
-                    st.json({k: v for k, v in ex.items() if not k.startswith("_")})
-
-        # ── Stage 3: Compare ──────────────────────────────────────────────
-        status_box.info("📊 Comparing data…")
-        log("Running comparison…")
-        results = compare_all(
-            user_data,
-            all_extracted,
-            url_source_map,
-            SOURCE_FIELDS,
+# ── Re-download previous results ──────────────────────────────────────────────
+if st.session_state.get("results"):
+    st.markdown("---")
+    st.markdown("**Previous results still available:**")
+    excel_bytes = write_excel(st.session_state.results)
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.download_button(
+            label="📥 Re-download Last Report",
+            data=excel_bytes,
+            file_name=make_filename(st.session_state.user_data.get("Name", "")),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        log("Comparison done.")
-        progress.progress(0.92)
-
-        # ── Stage 4: Excel ────────────────────────────────────────────────
-        # ── STEP 4 — Run ──────────────────────────────────────────────────────────────
-        # ── STEP 4 — Run ──────────────────────────────────────────────────────────────
-        st.markdown('<div class="section-header">④ Run Analysis</div>', unsafe_allow_html=True)
-        
-        run_disabled = not (known_urls and gemini_api_key and scraper_api_key)
-        
-        if st.button("Start Analysis", disabled=run_disabled, type="primary"):
-            # Validate first
-            error_msg = None
-            if not gemini_api_key:
-                error_msg = "Please enter your Gemini API key."
-            elif not scraper_api_key:
-                error_msg = "Please enter your ScraperAPI key."
-            elif not known_urls:
-                error_msg = "No recognised directory URLs found."
-            elif not [f for f in ALL_FIELDS if user_data.get(f, "").strip()]:
-                error_msg = "Please fill in at least one business data field."
-        
-            if error_msg:
-                st.error(error_msg)
-            else:
-                # Save payload to session state
-                st.session_state.analysis_payload = {
-                    "user_data":      user_data,
-                    "known_urls":     known_urls,
-                    "url_source_map": url_source_map,
-                    "gemini_api_key":  gemini_api_key,
-                    "scraper_api_key": scraper_api_key,
-                }
-                # Switch page OUTSIDE any try/except block
-                st.switch_page("pages/analysis.py")
-        
-        elif run_disabled:
-            hints = []
-            if not gemini_api_key:  hints.append("enter your Gemini API key")
-            if not scraper_api_key: hints.append("enter your ScraperAPI key")
-            if not known_urls:      hints.append("paste at least one recognised directory URL")
-            st.caption(f"Please {' and '.join(hints)} to enable analysis.")
+    with col2:
+        if st.button("📊 View Results Page"):
+            st.switch_page("pages/analysis.py")
