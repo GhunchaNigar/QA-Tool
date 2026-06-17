@@ -297,20 +297,51 @@ def _match_category(u: str, e: str) -> bool:
     return _token_overlap(u, e) >= 0.50
 
 
+# Categories entered in the UI can hold up to 4 values, separated by
+# "|", ";", or newlines (the UI joins the 4 boxes with " | ").
+_CATEGORY_SPLIT_RE = re.compile(r"[|;\n]+")
+
+
+def _match_category_multi(user_val: str, extracted_val: str) -> bool:
+    """
+    The user may provide up to 4 categories. The field is CORRECT if ANY
+    one of the user's categories matches the extracted category on the
+    page — it's only INCORRECT if none of them match.
+    """
+    e_norm = normalize_general(str(extracted_val))
+    if not e_norm:
+        return False
+
+    candidates = [c.strip() for c in _CATEGORY_SPLIT_RE.split(str(user_val)) if c.strip()]
+    if not candidates:
+        return False
+
+    for cat in candidates:
+        u_norm = normalize_general(cat)
+        if u_norm and _match_category(u_norm, e_norm):
+            return True
+    return False
+
+
 # ── Main matching dispatcher ──────────────────────────────────────────────────
 
 def values_match(user_val: str, extracted_val: str, field: str) -> bool:
     """
     Route to the right matcher based on field type.
-    All inputs are already normalized strings.
     """
+    fl = field.lower()
+
+    # Category is handled before generic normalization since the user
+    # value may contain multiple "|"-separated categories that need to be
+    # split and checked individually — any single match counts as CORRECT.
+    if "category" in fl:
+        return _match_category_multi(user_val, extracted_val)
+
     u = normalize(str(user_val), field)
     e = normalize(str(extracted_val), field)
 
     if not u or not e:
         return False
-
-    fl = field.lower()
 
     if "phone" in fl:
         return _match_phone(u, e)
@@ -338,9 +369,6 @@ def values_match(user_val: str, extracted_val: str, field: str) -> bool:
 
     if "social" in fl:
         return _match_social(user_val, extracted_val)
-
-    if "category" in fl:
-        return _match_category(u, e)
 
     # Fallback: exact normalized match only (no risky substring)
     return u == e
