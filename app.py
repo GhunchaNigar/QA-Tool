@@ -341,49 +341,58 @@ if st.button("Start Analysis", disabled=run_disabled, type="primary"):
         progress.progress(0.92)
 
         # ── Stage 4: Excel ────────────────────────────────────────────────
-        status_box.info("Generating Excel report…")
-        excel_bytes = write_excel(results)
-        progress.progress(1.0)
-        st.session_state.results = results
-
-        status_box.success(f"✅ Analysis complete — {total} URL(s) checked.")
-        log("Excel report ready.")
-
-        correct   = sum(1 for r in results if r.get("Status") == "CORRECT")
-        incorrect = total - correct
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total URLs", total)
-        c2.metric("✅ Correct", correct)
-        c3.metric("❌ Issues Found", incorrect)
-
-        st.download_button(
-            label="📥 Download Excel Report",
-            data=excel_bytes,
-            file_name=make_filename(user_data.get("Name", "")),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True,
-        )
-
-    except Exception as e:
-        status_box.error(f"Error: {e}")
-        st.exception(e)
-
-elif run_disabled:
-    hints = []
-    if not gemini_api_key:  hints.append("enter your Gemini API key")
-    if not scraper_api_key: hints.append("enter your ScraperAPI key")
-    if not known_urls:      hints.append("paste at least one recognised directory URL")
-    st.caption(f"Please {' and '.join(hints)} to enable analysis.")
-
-# ── Re-download previous results ──────────────────────────────────────────────
-if st.session_state.results:
-    st.markdown("---")
-    st.markdown("**Previous results still available:**")
-    excel_bytes = write_excel(st.session_state.results)
-    st.download_button(
-        label="Re-download Last Report",
-        data=excel_bytes,
-        file_name=make_filename(st.session_state.user_data.get("Name", "")),
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        # ── STEP 4 — Run ──────────────────────────────────────────────────────────────
+        st.markdown('<div class="section-header">④ Run Analysis</div>', unsafe_allow_html=True)
+        
+        run_disabled = not (known_urls and gemini_api_key and scraper_api_key)
+        
+        if st.button("Start Analysis", disabled=run_disabled, type="primary"):
+            if not gemini_api_key:
+                st.error("Please enter your Gemini API key.")
+                st.stop()
+            if not scraper_api_key:
+                st.error("Please enter your ScraperAPI key.")
+                st.stop()
+            if not known_urls:
+                st.error("No recognised directory URLs found.")
+                st.stop()
+        
+            filled = [f for f in ALL_FIELDS if user_data.get(f, "").strip()]
+            if not filled:
+                st.error("Please fill in at least one business data field.")
+                st.stop()
+        
+            # Save everything to session state — analysis page will pick it up
+            st.session_state.analysis_payload = {
+                "user_data":      user_data,
+                "known_urls":     known_urls,
+                "url_source_map": url_source_map,
+                "gemini_api_key":  gemini_api_key,
+                "scraper_api_key": scraper_api_key,
+            }
+            st.switch_page("pages/analysis.py")
+        
+        elif run_disabled:
+            hints = []
+            if not gemini_api_key:  hints.append("enter your Gemini API key")
+            if not scraper_api_key: hints.append("enter your ScraperAPI key")
+            if not known_urls:      hints.append("paste at least one recognised directory URL")
+            st.caption(f"Please {' and '.join(hints)} to enable analysis.")
+        
+        # ── Re-download previous results ──────────────────────────────────────────────
+        if st.session_state.get("results"):
+            st.markdown("---")
+            st.markdown("**Previous results still available:**")
+            from excel_writer import write_excel, make_filename
+            excel_bytes = write_excel(st.session_state.results)
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.download_button(
+                    label="Re-download Last Report",
+                    data=excel_bytes,
+                    file_name=make_filename(st.session_state.user_data.get("Name", "")),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with col2:
+                if st.button("View Results Page"):
+                    st.switch_page("pages/analysis.py")
