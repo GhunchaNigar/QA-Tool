@@ -88,7 +88,23 @@ for chunk in chunks:
     cols = st.columns(COLS)
     for i, field in enumerate(chunk):
         with cols[i]:
-            if field in VISUAL_FIELDS:
+            if field == "Category":
+                st.markdown(f"**{field}**")
+                cat_vals = []
+                prev = st.session_state.user_data.get(field, "")
+                prev_parts = [p.strip() for p in prev.split("|")] + ["", "", "", ""]
+                for ci in range(4):
+                    cat_vals.append(
+                        st.text_input(
+                            f"Category {ci + 1}",
+                            key=f"field_{field}_{ci}",
+                            value=prev_parts[ci],
+                            label_visibility="collapsed" if ci > 0 else "visible",
+                            placeholder=f"Category {ci + 1}",
+                        )
+                    )
+                user_data[field] = " | ".join(v.strip() for v in cat_vals if v.strip())
+            elif field in VISUAL_FIELDS:
                 sel = st.selectbox(
                     field,
                     options=["Yes — should be present", "No — not required"],
