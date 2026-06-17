@@ -135,11 +135,15 @@ st.markdown("---")
 # ── STEP 3 — URLs ─────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header">③ Live Directory URLs</div>', unsafe_allow_html=True)
 
-supported_domains = ", ".join(sorted(SOURCE_FIELDS.keys()))
-st.markdown(
-    f"Paste one URL per line. Supported directories: `{supported_domains}`  \n"
-    "URLs from **unknown** directories will be skipped."
+# Supported directories — collapsed behind expander
+sorted_domains = sorted(SOURCE_FIELDS.keys())
+domain_badges_html = " ".join(
+    f'<span class="source-badge">{d}</span>' for d in sorted_domains
 )
+with st.expander(f"📋 View {len(sorted_domains)} supported directories"):
+    st.markdown(domain_badges_html, unsafe_allow_html=True)
+
+st.markdown("Paste one URL per line. URLs from **unknown** directories will be skipped.")
 
 links_text = st.text_area(
     "Live URLs (one per line)",
@@ -169,25 +173,28 @@ for url in raw_links:
         unknown_urls.append(url)
 
 if raw_links:
-    # Show per-source breakdown
-    source_counts: dict = {}
-    for url in known_urls:
-        s = url_source_map[url]
-        source_counts[s] = source_counts.get(s, 0) + 1
-
-    badges = " ".join(
-        f'<span class="source-badge">{s}: {n}</span>'
-        for s, n in sorted(source_counts.items())
-    )
+    # Summary line
+    summary_parts = [f"**{len(known_urls)} recognised**"]
     if unknown_urls:
-        badges += f' <span class="unknown-badge">Unknown: {len(unknown_urls)} (skipped)</span>'
+        summary_parts.append(f"**{len(unknown_urls)} unknown**")
+    st.markdown(f"{len(raw_links)} URL(s) detected — " + ", ".join(summary_parts))
 
-    st.markdown(f"**{len(known_urls)} URL(s) recognised** — {badges}", unsafe_allow_html=True)
-
-    if unknown_urls:
-        with st.expander(f"⚠️ {len(unknown_urls)} unrecognised URL(s) — will be skipped"):
+    with st.expander(f"Show all {len(raw_links)} URL(s)"):
+        if known_urls:
+            st.markdown("**✅ Recognised URLs**")
+            for u in known_urls:
+                src_label = url_source_map[u]
+                st.markdown(
+                    f'<span class="source-badge">{src_label}</span> {u}',
+                    unsafe_allow_html=True,
+                )
+        if unknown_urls:
+            st.markdown("**⚠️ Unrecognised URLs — will be skipped**")
             for u in unknown_urls:
-                st.code(u, language=None)
+                st.markdown(
+                    f'<span class="unknown-badge">unknown</span> {u}',
+                    unsafe_allow_html=True,
+                )
 else:
     st.warning("No valid URLs detected yet. Paste links above (must start with http).")
 
