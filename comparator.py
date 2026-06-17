@@ -11,9 +11,30 @@ import unicodedata
 from fields_config import NA_OVERRIDES, VISUAL_FIELDS, ALL_FIELDS
 
 
-# ── Normalizers ───────────────────────────────────────────────────────────────
+# ── US State lookup ───────────────────────────────────────────────────────────
 
-# Common English stop words to ignore in fuzzy text matching
+_US_STATES = {
+    "al": "alabama", "ak": "alaska", "az": "arizona", "ar": "arkansas",
+    "ca": "california", "co": "colorado", "ct": "connecticut", "de": "delaware",
+    "fl": "florida", "ga": "georgia", "hi": "hawaii", "id": "idaho",
+    "il": "illinois", "in": "indiana", "ia": "iowa", "ks": "kansas",
+    "ky": "kentucky", "la": "louisiana", "me": "maine", "md": "maryland",
+    "ma": "massachusetts", "mi": "michigan", "mn": "minnesota", "ms": "mississippi",
+    "mo": "missouri", "mt": "montana", "ne": "nebraska", "nv": "nevada",
+    "nh": "new hampshire", "nj": "new jersey", "nm": "new mexico", "ny": "new york",
+    "nc": "north carolina", "nd": "north dakota", "oh": "ohio", "ok": "oklahoma",
+    "or": "oregon", "pa": "pennsylvania", "ri": "rhode island", "sc": "south carolina",
+    "sd": "south dakota", "tn": "tennessee", "tx": "texas", "ut": "utah",
+    "vt": "vermont", "va": "virginia", "wa": "washington", "wv": "west virginia",
+    "wi": "wisconsin", "wy": "wyoming", "dc": "district of columbia",
+}
+
+# Reverse map: full name -> abbreviation
+_US_STATE_ABBREVS = {v: k for k, v in _US_STATES.items()}
+
+
+# ── Common English stop words ─────────────────────────────────────────────────
+
 _STOP_WORDS = {
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "is", "are", "was", "were", "be", "been", "has",
@@ -29,6 +50,7 @@ _LEGAL_SUFFIXES = re.compile(
 )
 
 
+# ── Normalizers ───────────────────────────────────────────────────────────────
 
 def _to_ascii(value: str) -> str:
     """Normalize unicode to closest ASCII equivalent."""
@@ -60,18 +82,38 @@ def normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", v).strip()
 
 
+def normalize_state(value: str) -> str:
+    """
+    Always resolve to the full lowercase state name so that abbreviations
+    and full names compare equal.
+      'NJ'          -> 'new jersey'
+      'New Jersey'  -> 'new jersey'
+      'new jersey'  -> 'new jersey'
+    Falls back to the cleaned raw string for unrecognised values.
+    """
+    v = value.strip().lower()
+    # Abbreviation -> full name
+    if v in _US_STATES:
+        return _US_STATES[v]
+    # Already a full name
+    if v in _US_STATE_ABBREVS:
+        return v
+    # Unknown — return as-is (cleaned)
+    return v
+
+
 def normalize_address(value: str) -> str:
     """Lowercase, expand common abbreviations, strip punctuation."""
     v = _to_ascii(value).lower().strip()
     abbrevs = {
-        r"\bst\b":   "street",
-        r"\bave\b":  "avenue",
-        r"\bblvd\b": "boulevard",
-        r"\brd\b":   "road",
-        r"\bdr\b":   "drive",
-        r"\bln\b":   "lane",
-        r"\bct\b":   "court",
-        r"\bpl\b":   "place",
+        r"\bst\b":    "street",
+        r"\bave\b":   "avenue",
+        r"\bblvd\b":  "boulevard",
+        r"\brd\b":    "road",
+        r"\bdr\b":    "drive",
+        r"\bln\b":    "lane",
+        r"\bct\b":    "court",
+        r"\bpl\b":    "place",
         r"\bsuite\b": "ste",
     }
     for pattern, replacement in abbrevs.items():
@@ -127,7 +169,9 @@ def normalize(value: str, field: str = "") -> str:
         return normalize_name(value)
     if fl == "country":
         return normalize_country(value)
-    if fl in ("street", "city", "state", "zipcode"):
+    if fl == "state":
+        return normalize_state(value)
+    if fl in ("street", "city", "zipcode"):
         return normalize_address(value)
     if "email" in fl:
         return normalize_email(value)
@@ -172,7 +216,6 @@ def _match_url(u: str, e: str) -> bool:
         return False
     if u == e:
         return True
-    # Allow extracted to be the same domain with an extra path
     u_domain = u.split("/")[0]
     e_domain = e.split("/")[0]
     return u_domain == e_domain
@@ -195,13 +238,9 @@ def _match_name(u: str, e: str) -> bool:
     if not tu or not te:
         return False
     shorter, longer = (tu, te) if len(tu) <= len(te) else (te, tu)
-    # All tokens of the shorter must appear in the longer
     if shorter <= longer:
-        # Extra guard: the shorter must be at least 2 tokens OR a known proper noun
-        # (prevents single-word false positives like "Al" ⊆ "Alabama Medical")
         if len(shorter) >= 2:
             return True
-        # Single token: only match if the token is long enough to be distinctive
         token = next(iter(shorter))
         return len(token) >= 5
     return False
@@ -237,19 +276,14 @@ def _match_description(u: str, e: str) -> bool:
     - The extracted text is a leading substring of the user description
       (handles "See More" truncation — site only shows first N chars).
     """
-    # Direct token overlap
     overlap = _token_overlap(u, e)
     if overlap >= 0.55:
         return True
-    # Handle truncation: if extracted text is short and is a prefix of user text,
-    # count it as a match (the page showed a truncated version)
     if len(e) > 50 and u.startswith(e[:min(len(e), 80)]):
         return True
-    # Also check if extracted is contained within user description (truncated middle)
     e_tokens = _meaningful_tokens(e)
     u_tokens = _meaningful_tokens(u)
     if e_tokens and u_tokens:
-        # If most extracted tokens are in user text, the page shows a subset → CORRECT
         reverse_overlap = len(e_tokens & u_tokens) / len(e_tokens)
         if reverse_overlap >= 0.80 and len(e_tokens) >= 10:
             return True
@@ -279,10 +313,12 @@ def _match_hours(u: str, e: str) -> bool:
 def _match_social(u: str, e: str) -> bool:
     """
     Social links: extract domain names from URLs and check overlap.
-    e.g. facebook.com, linkedin.com
     """
     def extract_domains(text):
-        return set(re.findall(r"(facebook|twitter|linkedin|instagram|youtube|tiktok|pinterest)", text.lower()))
+        return set(re.findall(
+            r"(facebook|twitter|linkedin|instagram|youtube|tiktok|pinterest)",
+            text.lower()
+        ))
     ud = extract_domains(u)
     ed = extract_domains(e)
     if not ud:
@@ -297,16 +333,14 @@ def _match_category(u: str, e: str) -> bool:
     return _token_overlap(u, e) >= 0.50
 
 
-# Categories entered in the UI can hold up to 4 values, separated by
-# "|", ";", or newlines (the UI joins the 4 boxes with " | ").
 _CATEGORY_SPLIT_RE = re.compile(r"[|;\n]+")
 
 
 def _match_category_multi(user_val: str, extracted_val: str) -> bool:
     """
-    The user may provide up to 4 categories. The field is CORRECT if ANY
-    one of the user's categories matches the extracted category on the
-    page — it's only INCORRECT if none of them match.
+    The user may provide up to 4 categories (joined by " | ").
+    CORRECT if ANY one of the user's categories matches the extracted value.
+    INCORRECT only if none match.
     """
     e_norm = normalize_general(str(extracted_val))
     if not e_norm:
@@ -331,9 +365,8 @@ def values_match(user_val: str, extracted_val: str, field: str) -> bool:
     """
     fl = field.lower()
 
-    # Category is handled before generic normalization since the user
-    # value may contain multiple "|"-separated categories that need to be
-    # split and checked individually — any single match counts as CORRECT.
+    # Category handled before normalization — user value may contain multiple
+    # "|"-separated entries; any single match counts as CORRECT.
     if "category" in fl:
         return _match_category_multi(user_val, extracted_val)
 
@@ -352,14 +385,19 @@ def values_match(user_val: str, extracted_val: str, field: str) -> bool:
     if fl == "name":
         return _match_name(u, e)
 
-    if fl in ("street", "city", "state", "zipcode", "country"):
+    if fl in ("street", "city", "zipcode", "country"):
         return _match_address_field(u, e)
+
+    # State: both sides are already normalized to full name by normalize_state(),
+    # so a simple equality check is sufficient.
+    if fl == "state":
+        return u == e
 
     if "email" in fl:
         return u == e  # emails must be exact
 
     if "keyword" in fl:
-        return _match_keywords(user_val, extracted_val)  # raw values (not normalized)
+        return _match_keywords(user_val, extracted_val)  # raw values
 
     if "description" in fl or "about" in fl:
         return _match_description(u, e)
@@ -370,7 +408,7 @@ def values_match(user_val: str, extracted_val: str, field: str) -> bool:
     if "social" in fl:
         return _match_social(user_val, extracted_val)
 
-    # Fallback: exact normalized match only (no risky substring)
+    # Fallback: exact normalized match
     return u == e
 
 
